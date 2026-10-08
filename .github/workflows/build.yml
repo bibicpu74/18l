@@ -1,4 +1,4 @@
-name: LineageOS 22.2 - BuildBuddy RBE Real Compile Test
+name: LineageOS 18.1 - BuildBuddy RBE Real Compile Test
 
 on:
   workflow_dispatch:
@@ -7,13 +7,13 @@ permissions:
   contents: read
 
 concurrency:
-  group: los22-star2lte-rbe-real-test
+  group: los18-star2lte-rbe-real-test
   cancel-in-progress: true
 
 jobs:
   rbe-test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 360
 
     env:
       BUILDBUDDY_API_KEY: "${{ secrets.BUILDBUDDY_API_KEY }}"
@@ -276,27 +276,27 @@ jobs:
 
           mkdir -p /tmp/rbe-test
 
-          # Lineage's breakfast helper reads the correct target release from
-          # vendor/lineage/vars/aosp_target_release and expands star2lte to
-          # lineage_star2lte-<release>-userdebug.
+          # LineageOS 18.1 / Android 11 uses PRODUCT-VARIANT format.
+          # TARGET_RELEASE and aosp_target_release are for newer build trees.
+          if [ ! -f build/envsetup.sh ]; then
+            echo "::error::Missing build/envsetup.sh; check repo sync and working-directory."
+            exit 1
+          fi
           source build/envsetup.sh
-          source vendor/lineage/vars/aosp_target_release
-
-          EXPECTED_RELEASE="${aosp_target_release}"
-          breakfast star2lte userdebug
+          lunch lineage_star2lte-userdebug
 
           echo "=== LINEAGE BUILD SELECTION ==="
           echo "ANDROID_BUILD_TOP=${ANDROID_BUILD_TOP:-unset}"
           echo "TARGET_PRODUCT=${TARGET_PRODUCT:-unset}"
-          echo "TARGET_RELEASE=${TARGET_RELEASE:-unset}"
           echo "TARGET_BUILD_VARIANT=${TARGET_BUILD_VARIANT:-unset}"
           echo "TARGET_BUILD_TYPE=${TARGET_BUILD_TYPE:-unset}"
-          echo "EXPECTED_RELEASE=${EXPECTED_RELEASE}"
 
-          test -n "${ANDROID_BUILD_TOP:-}"
-          test "${TARGET_PRODUCT}" = "lineage_star2lte"
-          test "${TARGET_RELEASE}" = "${EXPECTED_RELEASE}"
-          test "${TARGET_BUILD_VARIANT}" = "userdebug"
+          if [ -z "${ANDROID_BUILD_TOP:-}" ] || \
+             [ "${TARGET_PRODUCT:-}" != "lineage_star2lte" ] || \
+             [ "${TARGET_BUILD_VARIANT:-}" != "userdebug" ]; then
+            echo "::error::Invalid LineageOS build configuration."
+            exit 1
+          fi
 
           if [ "$(cd "$ANDROID_BUILD_TOP" && pwd -P)" != "$(pwd -P)" ]; then
             echo "::error::ANDROID_BUILD_TOP does not point at the current source tree."
@@ -395,7 +395,7 @@ jobs:
             2>/dev/null | head -200 || true
 
           echo "=== RBE TEST PASSED ==="
-          echo "Lineage product: ${TARGET_PRODUCT}-${TARGET_RELEASE}-${TARGET_BUILD_VARIANT}"
+          echo "Lineage product: ${TARGET_PRODUCT}-${TARGET_BUILD_VARIANT}"
           echo "Real C++ module build completed with RBE_CXX_EXEC_STRATEGY=remote."
 
       - name: RBE diagnostics
