@@ -398,12 +398,37 @@ jobs:
             exit 1
           fi
 
+          # Android 11 reclient 0.25 may encode the exec-root itself as "."
+          # in Command.working_directory. BuildBuddy rejects that value.
+          # Put the exec root one level above the source checkout, so that
+          # the working directory within the input root becomes "los".
+          # This changes input/output path mapping and requires a real RBE test.
+          export RBE_exec_root="$(dirname "$(pwd -P)")"
+          RBE_REL_WORKDIR="$(realpath --relative-to="$RBE_exec_root" "$(pwd -P)")"
+
+          echo "=== RBE WORKING DIRECTORY COMPATIBILITY ==="
+          echo "RBE_exec_root=$RBE_exec_root"
+          echo "RBE_REL_WORKDIR=$RBE_REL_WORKDIR"
+          if [ "$RBE_REL_WORKDIR" != "los" ]; then
+            echo "::error::Unexpected RBE working directory: $RBE_REL_WORKDIR"
+            exit 1
+          fi
+          if [ ! -d "$RBE_exec_root/$RBE_REL_WORKDIR/bionic" ]; then
+            echo "::error::Android source tree is missing under RBE_exec_root."
+            exit 1
+          fi
+          printf 'RBE_exec_root=%s\nRBE_relative_working_dir=%s\n' \
+            "$RBE_exec_root" "$RBE_REL_WORKDIR" \
+            > /tmp/rbe-test/rbe-working-directory.txt
+
           echo "=== EFFECTIVE RBE CONFIG ==="
           {
             echo "USE_RBE=${USE_RBE}"
             echo "RBE_service=${RBE_service}"
             echo "RBE_service_no_security=${RBE_service_no_security}"
             echo "RBE_DIR=${RBE_DIR}"
+            echo "RBE_exec_root=${RBE_exec_root}"
+            echo "RBE_relative_working_dir=${RBE_REL_WORKDIR}"
             echo "RBE_CXX_EXEC_STRATEGY=${RBE_CXX_EXEC_STRATEGY}"
             echo "RBE_use_application_default_credentials=${RBE_use_application_default_credentials}"
             echo "RBE_use_rpc_credentials=${RBE_use_rpc_credentials}"
@@ -489,7 +514,7 @@ jobs:
 
             echo "=== RECLIENT ERROR SCAN ==="
             grep -aRinE \
-              'UNAUTHENTICATED|PERMISSION_DENIED|PermissionDenied|Unauthenticated|Unavailable|DeadlineExceeded|InvalidArgument|ResourceExhausted|ERROR|FATAL|failed|connection refused|no such file|exec format error' \
+              'UNAUTHENTICATED|PERMISSION_DENIED|PermissionDenied|Unauthenticated|Unavailable|DeadlineExceeded|InvalidArgument|working_directory|input root|ResourceExhausted|ERROR|FATAL|failed|connection refused|no such file|exec format error' \
               /tmp/rbe-test \
               --exclude=real-cxx-compile.log \
               --exclude=m-nothing.log \
@@ -561,7 +586,7 @@ jobs:
 
           echo "=== RBE ERROR SUMMARY ==="
           grep -aRinE \
-            'UNAUTHENTICATED|PERMISSION_DENIED|PermissionDenied|Unauthenticated|Unavailable|DeadlineExceeded|InvalidArgument|ResourceExhausted|ERROR|FATAL|failed|connection refused|no such file|exec format error' \
+            'UNAUTHENTICATED|PERMISSION_DENIED|PermissionDenied|Unauthenticated|Unavailable|DeadlineExceeded|InvalidArgument|working_directory|input root|ResourceExhausted|ERROR|FATAL|failed|connection refused|no such file|exec format error' \
             /tmp/rbe-test \
             --exclude=real-cxx-compile.log \
             --exclude=m-nothing.log \
