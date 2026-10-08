@@ -1,4 +1,4 @@
-name: LineageOS 18.1 - BuildBuddy RBE + Storage Profiling
+name: LineageOS 18.1 - BuildBuddy RBE + Prebuilts Breakdown
 
 on:
   workflow_dispatch:
@@ -269,6 +269,33 @@ jobs:
             echo '=== AVAILABLE DISK (BYTES) ==='
             df -B1 --output=source,size,used,avail,pcent,target /home/runner/work/los
           } 2>&1 | tee "$LOG"
+
+          # Detail the largest checked-out prebuilts and repo metadata.
+          # Diagnostic-only: never delete, prune, or mutate Android sources.
+          echo '=== PREBUILTS STORAGE BREAKDOWN ==='
+          if [ -d prebuilts ]; then
+            du -xhd1 prebuilts 2>/dev/null | sort -h \
+              > /tmp/rbe-test/prebuilts-size.log || true
+            du -xhd2 prebuilts 2>/dev/null | sort -h \
+              > /tmp/rbe-test/prebuilts-detail.log || true
+            echo '--- PREBUILTS LEVEL 1 ---'
+            tail -n 60 /tmp/rbe-test/prebuilts-size.log || true
+            echo '--- PREBUILTS LEVEL 2 (LARGEST 80) ---'
+            tail -n 80 /tmp/rbe-test/prebuilts-detail.log || true
+          else
+            echo '::warning::prebuilts directory was not found.'
+          fi
+
+          echo '=== REPO METADATA STORAGE BREAKDOWN ==='
+          if [ -d .repo ]; then
+            du -xhd2 .repo 2>/dev/null | sort -h \
+              > /tmp/rbe-test/repo-size.log || true
+            echo '--- REPO METADATA (LARGEST 40) ---'
+            tail -n 40 /tmp/rbe-test/repo-size.log || true
+          else
+            echo '::warning::.repo directory was not found.'
+          fi
+          sample post-storage-breakdown
 
           echo '=== STORAGE BASELINE COMPLETE ==='
 
@@ -832,6 +859,24 @@ jobs:
             if [ -s /tmp/rbe-test/disk-stop-triggered.txt ]; then
               echo '**Guard triggered: build terminated due to low disk.**'
             fi
+            echo ''
+            echo '### Prebuilts: largest directories (post-sync)'
+            if [ -s /tmp/rbe-test/prebuilts-size.log ]; then
+              echo '```text'
+              tail -n 16 /tmp/rbe-test/prebuilts-size.log
+              echo '```'
+            else
+              echo 'No prebuilts breakdown was captured.'
+            fi
+            echo ''
+            echo '### Git repo metadata: largest directories (post-sync)'
+            if [ -s /tmp/rbe-test/repo-size.log ]; then
+              echo '```text'
+              tail -n 12 /tmp/rbe-test/repo-size.log
+              echo '```'
+            else
+              echo 'No .repo breakdown was captured.'
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
           echo '=== FINAL DISK AND MEMORY ==='
           df -h / /home/runner/work/los || true
@@ -874,6 +919,11 @@ jobs:
           tail -n 30 /tmp/rbe-test/resource-samples.tsv 2>/dev/null || true
           echo "=== RESOURCE MONITOR ==="
           tail -n 60 /tmp/rbe-test/resource-monitor.log 2>/dev/null || true
+
+          echo '=== PREBUILTS LARGEST DIRECTORIES ==='
+          tail -n 25 /tmp/rbe-test/prebuilts-detail.log 2>/dev/null || true
+          echo '=== REPO METADATA LARGEST DIRECTORIES ==='
+          tail -n 25 /tmp/rbe-test/repo-size.log 2>/dev/null || true
 
           echo "=== REPROXY LOG TAIL ==="
           tail -n 220 /tmp/rbe-test/reproxy_log.txt 2>/dev/null || true
