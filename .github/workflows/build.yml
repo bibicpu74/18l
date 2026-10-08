@@ -1,4 +1,4 @@
-name: LineageOS 18.1 - BuildBuddy RBE Parallel 2 Test
+name: LineageOS 18.1 - BuildBuddy RBE + Storage Profiling
 
 on:
   workflow_dispatch:
@@ -45,6 +45,10 @@ jobs:
       NINJA_REMOTE_NUM_JOBS: "2"
       NINJA_HIGHMEM_NUM_JOBS: "1"
 
+      # GiB of available disk space (statvfs/df -B1, not rounded df -h).
+      DISK_WARN_GIB: "25"
+      DISK_STOP_GIB: "15"
+
     steps:
       - name: Reclaim root disk
         shell: bash
@@ -69,6 +73,16 @@ jobs:
           free -h
           echo "=== CPU ==="
           nproc
+
+          # Persist a clean-runner baseline before package installation/sync.
+          # No tokens or secrets are written to this log.
+          TS=/tmp/rbe-test/resource-samples.tsv
+          printf 'timestamp\tstage\tdisk_available_bytes\tdisk_used_bytes\tmem_available_kib\n' > "$TS"
+          printf '%s\tpost-reclaim\t%s\t%s\t%s\n' \
+            "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            "$(df -B1 --output=avail / | tail -n1 | tr -d ' ')" \
+            "$(df -B1 --output=used / | tail -n1 | tr -d ' ')" \
+            "$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)" >> "$TS"
 
       - name: Checkout local manifest
         uses: actions/checkout@v4
@@ -203,6 +217,60 @@ jobs:
 
           echo "=== POST-SYNC DISK ==="
           df -h / /home/runner/work/los
+
+      # Collect post-sync storage attribution while the tree is still clean.
+      # This is diagnostic-only and does not mutate .repo, source, or out.
+      - name: Profile storage after repo sync
+        if: success()
+        working-directory: /home/runner/work/los
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p /tmp/rbe-test
+          LOG=/tmp/rbe-test/disk-analysis.log
+          TS=/tmp/rbe-test/resource-samples.tsv
+          if [ ! -s "$TS" ]; then
+            printf 'timestamp\tstage\tdisk_available_bytes\tdisk_used_bytes\tmem_available_kib\n' > "$TS"
+          fi
+
+          sample() {
+            local stage="$1" available used mem
+            available="$(df -B1 --output=avail "$PWD" | tail -n 1 | tr -d ' ')"
+            used="$(df -B1 --output=used "$PWD" | tail -n 1 | tr -d ' ')"
+            mem="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
+            printf '%s\t%s\t%s\t%s\t%s\n' \
+              "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$stage" "$available" "$used" "$mem" >> "$TS"
+          }
+          sample post-sync
+
+          {
+            echo '=== POST-SYNC DISK ANALYSIS ==='
+            date -u +'%Y-%m-%dT%H:%M:%SZ'
+            echo '=== MOUNT POINTS ==='
+            df -hT / /mnt /home/runner/work/los
+            echo '=== BLOCK DEVICES ==='
+            lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINTS
+            echo '=== INODES ==='
+            df -i /home/runner/work/los
+            echo '=== GIT OBJECT STORAGE ==='
+            du -sh .repo 2>/dev/null || true
+            echo '=== OUTPUT TREE ==='
+            du -sh out 2>/dev/null || true
+            echo '=== SOURCE TREE - FIRST LEVEL ==='
+            du -xhd1 . 2>/dev/null | sort -h | tail -n 50 || true
+            echo '=== RUNNER SYSTEM FOOTPRINT ==='
+            # Avoid scanning /home/runner/work twice (large Android checkout).
+            sudo du -xhd1 /opt /usr/local /var 2>/dev/null | sort -h | tail -n 35 || true
+            du -sh /home/runner/.cache /home/runner/.local /home/runner/.cargo \
+              2>/dev/null || true
+            echo '=== MEMORY ==='
+            free -h
+            echo '=== AVAILABLE DISK (BYTES) ==='
+            df -B1 --output=source,size,used,avail,pcent,target /home/runner/work/los
+          } 2>&1 | tee "$LOG"
+
+          echo '=== STORAGE BASELINE COMPLETE ==='
 
       - name: Verify star2lte product registration
         working-directory: /home/runner/work/los
@@ -500,8 +568,37 @@ jobs:
             echo "NINJA_REMOTE_NUM_JOBS=${NINJA_REMOTE_NUM_JOBS}"
           } | tee /tmp/rbe-test/rbe-env.txt
 
+          # Write stage-specific samples for easy comparison, using bytes
+          # instead of the rounded df -h values.
+          DISK_SAMPLES=/tmp/rbe-test/resource-samples.tsv
+          if [ ! -f "$DISK_SAMPLES" ]; then
+            printf 'timestamp\tstage\tdisk_available_bytes\tdisk_used_bytes\tmem_available_kib\n' > "$DISK_SAMPLES"
+          fi
+          disk_sample() {
+            local stage="$1" available used mem
+            available="$(df -B1 --output=avail "$PWD" | tail -n 1 | tr -d ' ')"
+            used="$(df -B1 --output=used "$PWD" | tail -n 1 | tr -d ' ')"
+            mem="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
+            printf '%s\t%s\t%s\t%s\t%s\n' \
+              "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$stage" "$available" "$used" "$mem" >> "$DISK_SAMPLES"
+            printf '%s\n' "$available"
+          }
+          enforce_initial_disk_guard() {
+            local stage="$1" available threshold
+            available="$(disk_sample "$stage")"
+            threshold=$((DISK_STOP_GIB * 1024 * 1024 * 1024))
+            if (( available < threshold )); then
+              echo "::error::Available disk below ${DISK_STOP_GIB} GiB at ${stage}; refusing to start/continue build."
+              df -h /home/runner/work/los
+              exit 1
+            fi
+            echo "=== DISK AT ${stage}: $((available / 1073741824)) GiB free ==="
+          }
+          enforce_initial_disk_guard pre-graph
+
           echo "=== GENERATE BUILD GRAPH ==="
           m nothing 2>&1 | tee /tmp/rbe-test/m-nothing.log
+          enforce_initial_disk_guard post-graph
 
           BUILD_NINJA="$ANDROID_BUILD_TOP/out/combined-${TARGET_PRODUCT}.ninja"
 
@@ -558,12 +655,85 @@ jobs:
           echo "This is intentionally a clean source-output build without restored ccache."
           echo "RBE_CXX_EXEC_STRATEGY=remote makes a remote failure fatal instead of silently falling back locally."
 
-          # Capture failure without losing the real build status to tee/pipefail.
-          set +e
+          enforce_initial_disk_guard pre-build
+
+          # Run the same tested m -j2 libbase pipeline in a subshell so the
+          # parent can sample resources and stop its process tree on low disk.
+          # Keep the existing reclient, BuildBuddy bridge, and remote-only mode.
           echo "NINJA_REMOTE_NUM_JOBS=${NINJA_REMOTE_NUM_JOBS}; NINJA_HIGHMEM_NUM_JOBS=${NINJA_HIGHMEM_NUM_JOBS}; build jobs=2"
-          m -j2 libbase 2>&1 | tee /tmp/rbe-test/real-cxx-compile.log
-          BUILD_RC=${PIPESTATUS[0]}
+          BUILD_STATUS_FILE=/tmp/rbe-test/build-exit-code.txt
+          DISK_TRIP_FILE=/tmp/rbe-test/disk-stop-triggered.txt
+          rm -f "$BUILD_STATUS_FILE" "$DISK_TRIP_FILE"
+
+          (
+            set +e
+            set -o pipefail
+            m -j2 libbase 2>&1 | tee /tmp/rbe-test/real-cxx-compile.log
+            rc=${PIPESTATUS[0]}
+            printf '%s\n' "$rc" > "$BUILD_STATUS_FILE"
+            exit "$rc"
+          ) &
+          BUILD_PID=$!
+
+          # Terminate children before parents so Ninja/Soong cannot keep using
+          # disk after the supervisor has decided to stop.
+          stop_process_tree() {
+            local pid="$1" child
+            while IFS= read -r child; do
+              [ -n "$child" ] || continue
+              stop_process_tree "$child"
+            done < <(pgrep -P "$pid" 2>/dev/null || true)
+            kill -TERM "$pid" 2>/dev/null || true
+          }
+          cleanup_build_supervisor() {
+            if kill -0 "$BUILD_PID" 2>/dev/null; then
+              stop_process_tree "$BUILD_PID"
+            fi
+          }
+          trap cleanup_build_supervisor EXIT
+
+          echo '=== 60-SECOND STORAGE / MEMORY MONITOR ==='
+          : > /tmp/rbe-test/resource-monitor.log
+          WARNED=0
+          while kill -0 "$BUILD_PID" 2>/dev/null; do
+            avail="$(disk_sample build-sample)"
+            free_gib=$((avail / 1073741824))
+            mem_kib="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
+            line="$(date -u +'%Y-%m-%dT%H:%M:%SZ') free=${free_gib}GiB mem_available=${mem_kib}KiB"
+            echo "$line" | tee -a /tmp/rbe-test/resource-monitor.log
+            if (( avail < DISK_STOP_GIB * 1073741824 )); then
+              echo "Disk safety stop: available below ${DISK_STOP_GIB} GiB" | tee "$DISK_TRIP_FILE"
+              echo "::error::Low disk detected; stopping m -j2 libbase to avoid filling runner root."
+              stop_process_tree "$BUILD_PID"
+              break
+            fi
+            if (( avail < DISK_WARN_GIB * 1073741824 && WARNED == 0 )); then
+              echo "::warning::Disk below ${DISK_WARN_GIB} GiB; keep watching free space."
+              WARNED=1
+            fi
+            # Sample every 60 seconds, but check whether the build ended
+            # every 5 seconds to avoid a needless final one-minute delay.
+            for ((tick=0; tick<12; tick++)); do
+              kill -0 "$BUILD_PID" 2>/dev/null || break
+              sleep 5
+            done
+          done
+
+          set +e
+          wait "$BUILD_PID"
+          WAIT_RC=$?
           set -e
+          trap - EXIT
+          BUILD_RC="$WAIT_RC"
+          if [ -s "$BUILD_STATUS_FILE" ]; then
+            BUILD_RC="$(cat "$BUILD_STATUS_FILE")"
+          fi
+          if [ -s "$DISK_TRIP_FILE" ]; then
+            BUILD_RC=70
+            echo "::error::Build stopped by disk safety guard; see resource-monitor.log."
+          fi
+          disk_sample post-build >/dev/null
+          echo "=== BUILD EXIT CODE: $BUILD_RC ==="
 
           if [ "$BUILD_RC" -ne 0 ]; then
             echo "=== RBE COMPILE FAILED (exit $BUILD_RC) ==="
@@ -631,6 +801,51 @@ jobs:
           echo "Lineage product: ${TARGET_PRODUCT}-${TARGET_BUILD_VARIANT}"
           echo "Real C++ module build completed with RBE_CXX_EXEC_STRATEGY=remote."
 
+      - name: Summarize storage measurements
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          mkdir -p /tmp/rbe-test
+          FILE=/tmp/rbe-test/resource-samples.tsv
+          {
+            echo '## LineageOS 18.1 storage profile'
+            echo ''
+            echo '| Stage (UTC) | Free GiB | Used GiB | RAM available GiB |'
+            echo '|---|---:|---:|---:|'
+            if [ -s "$FILE" ]; then
+              # Show first/last rows and build low-watermark; no expensive du.
+              awk -F '\t' 'NR>1 && NF>=5 {
+                free=$3/1073741824; used=$4/1073741824; ram=$5/1048576;
+                if (!seen || free<min) {min=free; low=$2 " " $1};
+                if ($2!="build-sample") printf "| %s: %s | %.1f | %.1f | %.1f |\n",$2,$1,free,used,ram;
+                seen=1
+              } END {
+                if(seen) printf "\nLowest observed free disk: **%.1f GiB** at %s.\n",min,low;
+                else print "No storage samples recorded."
+              }' "$FILE"
+            else
+              echo '| No measurements | — | — | — |'
+            fi
+            echo ''
+            echo "Disk guard: warning under ${DISK_WARN_GIB} GiB; safe stop under ${DISK_STOP_GIB} GiB."
+            if [ -s /tmp/rbe-test/disk-stop-triggered.txt ]; then
+              echo '**Guard triggered: build terminated due to low disk.**'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo '=== FINAL DISK AND MEMORY ==='
+          df -h / /home/runner/work/los || true
+          free -h || true
+
+          echo '=== POST-BUILD OUTPUT STORAGE ==='
+          {
+            date -u +'%Y-%m-%dT%H:%M:%SZ'
+            du -sh /home/runner/work/los/.repo /home/runner/work/los/out \
+              2>/dev/null || true
+            du -xhd1 /home/runner/work/los/out 2>/dev/null \
+              | sort -h | tail -n 35 || true
+          } 2>&1 | tee /tmp/rbe-test/disk-analysis-post-build.log
+
       - name: RBE diagnostics
         if: always()
         working-directory: /home/runner/work/los
@@ -655,6 +870,10 @@ jobs:
 
           echo "=== DISK ==="
           df -h / /home/runner/work/los || true
+          echo "=== STORAGE PROFILE SAMPLING ==="
+          tail -n 30 /tmp/rbe-test/resource-samples.tsv 2>/dev/null || true
+          echo "=== RESOURCE MONITOR ==="
+          tail -n 60 /tmp/rbe-test/resource-monitor.log 2>/dev/null || true
 
           echo "=== REPROXY LOG TAIL ==="
           tail -n 220 /tmp/rbe-test/reproxy_log.txt 2>/dev/null || true
