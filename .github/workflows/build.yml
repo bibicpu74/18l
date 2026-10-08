@@ -1,4 +1,4 @@
-name: LineageOS 18.1 - BuildBuddy RBE Pinned Reclient Test
+name: LineageOS 18.1 - BuildBuddy RBE Parallel 2 Test
 
 on:
   workflow_dispatch:
@@ -40,8 +40,9 @@ jobs:
       RBE_reproxy_wait_seconds: "30"
       RBE_v: "2"
 
-      # This workflow is a correctness / connectivity test, not a speed test.
-      NINJA_REMOTE_NUM_JOBS: "1"
+      # Conservative 2-job parallel remote compilation on GitHub hosted runner.
+      # Keep memory-intensive actions serial to reduce local memory pressure.
+      NINJA_REMOTE_NUM_JOBS: "2"
       NINJA_HIGHMEM_NUM_JOBS: "1"
 
     steps:
@@ -422,7 +423,9 @@ jobs:
 
       - name: Configure Lineage and run real RBE C++ compile
         working-directory: /home/runner/work/los
-        timeout-minutes: 45
+        # First successful remote executions reached 98% before the 45-minute limit.
+        # Allow the remote-only libbase correctness test to finish.
+        timeout-minutes: 180
         shell: bash
         run: |
           set -eo pipefail
@@ -557,7 +560,8 @@ jobs:
 
           # Capture failure without losing the real build status to tee/pipefail.
           set +e
-          m -j1 libbase 2>&1 | tee /tmp/rbe-test/real-cxx-compile.log
+          echo "NINJA_REMOTE_NUM_JOBS=${NINJA_REMOTE_NUM_JOBS}; NINJA_HIGHMEM_NUM_JOBS=${NINJA_HIGHMEM_NUM_JOBS}; build jobs=2"
+          m -j2 libbase 2>&1 | tee /tmp/rbe-test/real-cxx-compile.log
           BUILD_RC=${PIPESTATUS[0]}
           set -e
 
