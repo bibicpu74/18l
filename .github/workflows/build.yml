@@ -113,7 +113,9 @@ jobs:
             python-is-python3 \
             openjdk-21-jdk-headless \
             ninja-build \
-            nginx
+            nginx \
+            ca-certificates \
+            openssl
 
           mkdir -p "$HOME/bin"
           curl -fsSL \
@@ -278,6 +280,21 @@ jobs:
           timeout 15 bash -c 'cat < /dev/null > /dev/tcp/remote.buildbuddy.io/443'
 
           echo "BuildBuddy TCP endpoint is reachable."
+
+          echo "=== BUILD BUDDY TLS CHAIN DIAGNOSTIC ==="
+          TLS_LOG="/tmp/rbe-test/buildbuddy-tls-check.log"
+          mkdir -p /tmp/rbe-test
+          if ! timeout 20 openssl s_client \
+            -connect remote.buildbuddy.io:443 \
+            -servername remote.buildbuddy.io \
+            -verify_hostname remote.buildbuddy.io \
+            -verify_return_error \
+            -CAfile /etc/ssl/certs/ca-certificates.crt \
+            </dev/null > "$TLS_LOG" 2>&1; then
+            echo "::warning::OpenSSL certificate precheck returned an error; see artifact."
+          fi
+          grep -E 'Verification:|Verify return code:|verify error:|Verification error:|^subject=|^issuer=' "$TLS_LOG" | tail -30 || true
+
           echo "Authentication will be validated by the real reclient compile below."
 
       - name: Start authenticated BuildBuddy gRPC bridge
@@ -317,7 +334,10 @@ jobs:
               location / {
                 grpc_pass grpcs://remote.buildbuddy.io:443;
                 grpc_ssl_server_name on;
+                grpc_ssl_name remote.buildbuddy.io;
                 grpc_ssl_verify on;
+                # Android 11 bridge: allow intermediate CAs in the TLS chain.
+                grpc_ssl_verify_depth 5;
                 grpc_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
                 grpc_connect_timeout 30s;
                 grpc_read_timeout 300s;
