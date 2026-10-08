@@ -488,6 +488,87 @@ jobs:
             exit 1
           fi
 
+          # Android 11 reclient 0.25 can omit the output directory from the
+          # remote input tree. Local Ninja creates the directory, but remote
+          # clang starts in a clean sandbox and cannot write -o/-MF files.
+          # Add a tiny explicit input file in each compiled output directory.
+          # This forces the remote input tree to contain the directory without
+          # recursively uploading the whole local out/ directory.
+          echo "=== INSTALL RBE OUTPUT DIRECTORY INPUT SHIM ==="
+          REWRAPPER_PATH="$RBE_DIR/rewrapper"
+          ORIGINAL_REWRAPPER="$RBE_DIR/rewrapper.rbe-original"
+          if [ -e "$ORIGINAL_REWRAPPER" ]; then
+            echo "::error::Existing backup of rewrapper; refusing to overwrite it."
+            exit 1
+          fi
+          mv "$REWRAPPER_PATH" "$ORIGINAL_REWRAPPER"
+          cat > "$REWRAPPER_PATH" <<'PY_RBE_SHIM'
+          #!/usr/bin/env python3
+          """Ensure the output parent directory is present in the remote input tree."""
+          import os
+          import sys
+          from pathlib import Path
+
+          real = Path(__file__).resolve().with_name("rewrapper.rbe-original")
+          args = sys.argv[1:]
+          exec_root = Path(os.environ.get("RBE_exec_root", os.getcwd())).resolve()
+          build_top = Path(os.environ.get("ANDROID_BUILD_TOP", os.getcwd())).resolve()
+          out_root = build_top / "out"
+
+          # Restrict this compatibility workaround to remote Clang compiles.
+          is_compile = any("type=compile" in arg for arg in args)
+          is_clang = any(
+              Path(arg).name in ("clang", "clang++")
+              for arg in args if not arg.startswith("-")
+          )
+          if is_compile and is_clang:
+              outputs = []
+              for i, arg in enumerate(args):
+                  if arg in ("-o", "-MF") and i + 1 < len(args):
+                      outputs.append(args[i + 1])
+                  elif arg.startswith("-MF") and len(arg) > 3:
+                      outputs.append(arg[3:])
+              input_markers = []
+              for output in outputs:
+                  output_path = Path(output).absolute()
+                  parent = output_path.parent
+                  try:
+                      # Do not create/ship arbitrary paths outside Android out/.
+                      parent.relative_to(out_root)
+                      parent.relative_to(exec_root)
+                  except ValueError:
+                      continue
+                  parent.mkdir(parents=True, exist_ok=True)
+                  marker = parent / ".rbe-output-directory-input"
+                  marker.touch(exist_ok=True)
+                  relative_marker = marker.relative_to(exec_root).as_posix()
+                  if relative_marker not in input_markers:
+                      input_markers.append(relative_marker)
+
+              if input_markers:
+                  existing_index = next(
+                      (i for i, arg in enumerate(args) if arg.startswith("--inputs=")),
+                      None,
+                  )
+                  if existing_index is not None:
+                      args[existing_index] += "," + ",".join(input_markers)
+                  else:
+                      # Soong's rewrapper invocation puts all wrapper flags
+                      # before the clang executable (with or without --).
+                      idx = next(
+                          i for i, arg in enumerate(args)
+                          if Path(arg).name in ("clang", "clang++")
+                          and not arg.startswith("-")
+                      )
+                      args.insert(idx, "--inputs=" + ",".join(input_markers))
+                  with open("/tmp/rbe-test/output-dir-shim.log", "a") as log:
+                      log.write("added --inputs=" + ",".join(input_markers) + "\n")
+
+          os.execv(str(real), [str(real), *args])
+          PY_RBE_SHIM
+          chmod 0755 "$REWRAPPER_PATH"
+          echo "RBE output-dir shim installed; original binary preserved at $ORIGINAL_REWRAPPER"
+
           echo "=== REAL C++ BUILD: libbase ==="
           echo "This is intentionally a clean source-output build without restored ccache."
           echo "RBE_CXX_EXEC_STRATEGY=remote makes a remote failure fatal instead of silently falling back locally."
@@ -507,6 +588,9 @@ jobs:
             else
               echo "::warning::reproxy_log.txt missing or empty; listing available diagnostics."
             fi
+
+            echo "=== REMOTE OUTPUT DIRECTORY SHIM ==="
+            tail -n 30 /tmp/rbe-test/output-dir-shim.log 2>/dev/null || true
 
             echo "=== RECLIENT DIAGNOSTIC FILES ==="
             find /tmp/rbe-test -maxdepth 3 -type f \
@@ -598,8 +682,23 @@ jobs:
           echo "=== BUILD GRAPH LOG TAIL ==="
           tail -n 160 /tmp/rbe-test/m-nothing.log 2>/dev/null || true
 
+          echo "=== RBE OUTPUT DIRECTORY INPUTS ==="
+          tail -n 60 /tmp/rbe-test/output-dir-shim.log 2>/dev/null || true
+
           echo "=== REAL C++ BUILD LOG TAIL ==="
           tail -n 220 /tmp/rbe-test/real-cxx-compile.log 2>/dev/null || true
+
+      - name: Restore native rewrapper
+        if: always()
+        working-directory: /home/runner/work/los
+        shell: bash
+        run: |
+          set +e
+          REAL="$RBE_DIR/rewrapper.rbe-original"
+          if [ -f "$REAL" ]; then
+            mv -f "$REAL" "$RBE_DIR/rewrapper"
+            echo "Original Android 11 rewrapper restored."
+          fi
 
       - name: Stop BuildBuddy gRPC bridge and remove credentials
         if: always()
