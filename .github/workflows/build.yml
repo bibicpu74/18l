@@ -1,4 +1,4 @@
-name: LineageOS 18.1 - BuildBuddy RBE + Prebuilts Breakdown
+name: LineageOS 18.1 - BuildBuddy RBE + Deep Storage Profile
 
 on:
   workflow_dispatch:
@@ -295,9 +295,45 @@ jobs:
           else
             echo '::warning::.repo directory was not found.'
           fi
-          sample post-storage-breakdown
+          # Deep-dive into the largest storage groups from previous runs.
+          # Never delete source, prebuilts, .repo objects, or installed tools.
+          echo '=== CLANG TOOLCHAIN VERSION BREAKDOWN ==='
+          if [ -d prebuilts/clang ]; then
+            du -xhd4 prebuilts/clang 2>/dev/null | sort -h \
+              > /tmp/rbe-test/clang-detail.log || true
+            echo '--- CLANG LARGEST 35 ---'
+            tail -n 35 /tmp/rbe-test/clang-detail.log || true
+            find prebuilts/clang/host -mindepth 2 -maxdepth 2 \
+              -type d -name 'clang-*' -print 2>/dev/null | sort \
+              > /tmp/rbe-test/clang-versions.log || true
+          else
+            echo '::warning::prebuilts/clang missing'
+          fi
 
-          echo '=== STORAGE BASELINE COMPLETE ==='
+          echo '=== GRADLE PLUGIN BREAKDOWN ==='
+          if [ -d prebuilts/gradle-plugin ]; then
+            du -xhd4 prebuilts/gradle-plugin 2>/dev/null | sort -h \
+              > /tmp/rbe-test/gradle-detail.log || true
+            tail -n 25 /tmp/rbe-test/gradle-detail.log || true
+          fi
+
+          echo '=== PLATFORM GIT OBJECT BREAKDOWN ==='
+          if [ -d .repo/project-objects/platform ]; then
+            du -xhd4 .repo/project-objects/platform 2>/dev/null | sort -h \
+              > /tmp/rbe-test/platform-objects-detail.log || true
+            tail -n 35 /tmp/rbe-test/platform-objects-detail.log || true
+          fi
+
+          echo '=== MANIFEST PREBUILTS PROJECT PATHS ==='
+          # A candidate inventory only: NEVER change the synced manifest.
+          repo list -p 2> /tmp/rbe-test/prebuilts-projects-errors.log \
+            | grep -E '^prebuilts(/|$)' \
+            > /tmp/rbe-test/prebuilts-projects.log || true
+          echo "Registered prebuilts projects: $(wc -l < /tmp/rbe-test/prebuilts-projects.log)"
+          sed -n '1,120p' /tmp/rbe-test/prebuilts-projects.log || true
+          sample post-deep-storage-profile
+
+          echo '=== DEEP STORAGE BASELINE COMPLETE ==='
 
       - name: Verify star2lte product registration
         working-directory: /home/runner/work/los
@@ -877,6 +913,40 @@ jobs:
             else
               echo 'No .repo breakdown was captured.'
             fi
+            echo ''
+            echo '### Clang toolchains: largest paths'
+            if [ -s /tmp/rbe-test/clang-detail.log ]; then
+              echo '```text'
+              tail -n 18 /tmp/rbe-test/clang-detail.log
+              echo '```'
+            else
+              echo 'No Clang deep profile was captured.'
+            fi
+            echo ''
+            echo '### Gradle plugin: largest paths'
+            if [ -s /tmp/rbe-test/gradle-detail.log ]; then
+              echo '```text'
+              tail -n 10 /tmp/rbe-test/gradle-detail.log
+              echo '```'
+            else
+              echo 'No Gradle deep profile was captured.'
+            fi
+            echo ''
+            echo '### Platform Git objects: largest paths'
+            if [ -s /tmp/rbe-test/platform-objects-detail.log ]; then
+              echo '```text'
+              tail -n 16 /tmp/rbe-test/platform-objects-detail.log
+              echo '```'
+            else
+              echo 'No platform Git-object deep profile was captured.'
+            fi
+            echo ''
+            if [ -s /tmp/rbe-test/prebuilts-projects.log ]; then
+              echo "Prebuilts projects listed in manifest: **$(wc -l < /tmp/rbe-test/prebuilts-projects.log)**."
+            else
+              echo 'No prebuilts manifest project list was captured.'
+            fi
+            echo 'Diagnostic only; nothing was removed from the source tree.'
           } >> "$GITHUB_STEP_SUMMARY"
           echo '=== FINAL DISK AND MEMORY ==='
           df -h / /home/runner/work/los || true
@@ -924,6 +994,14 @@ jobs:
           tail -n 25 /tmp/rbe-test/prebuilts-detail.log 2>/dev/null || true
           echo '=== REPO METADATA LARGEST DIRECTORIES ==='
           tail -n 25 /tmp/rbe-test/repo-size.log 2>/dev/null || true
+          echo '=== CLANG TOOLCHAINS LARGEST DIRECTORIES ==='
+          tail -n 25 /tmp/rbe-test/clang-detail.log 2>/dev/null || true
+          echo '=== GRADLE PLUGIN LARGEST DIRECTORIES ==='
+          tail -n 15 /tmp/rbe-test/gradle-detail.log 2>/dev/null || true
+          echo '=== PLATFORM GIT OBJECTS LARGEST DIRECTORIES ==='
+          tail -n 25 /tmp/rbe-test/platform-objects-detail.log 2>/dev/null || true
+          echo '=== PREBUILTS MANIFEST PROJECT COUNT ==='
+          wc -l /tmp/rbe-test/prebuilts-projects.log 2>/dev/null || true
 
           echo "=== REPROXY LOG TAIL ==="
           tail -n 220 /tmp/rbe-test/reproxy_log.txt 2>/dev/null || true
