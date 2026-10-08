@@ -35,10 +35,11 @@ jobs:
 
       # Keep all RBE diagnostics in one place.
       RBE_log_dir: "/tmp/rbe-test"
+      RBE_log_path: "text:///tmp/rbe-test/reproxy_log.txt"
       RBE_proxy_log_dir: "/tmp/rbe-test"
       RBE_output_dir: "/tmp/rbe-test"
       RBE_reproxy_wait_seconds: "30"
-      RBE_v: "1"
+      RBE_v: "2"
 
       # This workflow is a correctness / connectivity test, not a speed test.
       NINJA_REMOTE_NUM_JOBS: "1"
@@ -243,6 +244,18 @@ jobs:
           test -x "$RBE_DIR/rewrapper"
           test -x "$RBE_DIR/bootstrap"
 
+          echo "=== RBE DEPENDENCY SCANNER ==="
+          if [ -f "$RBE_DIR/dependency_scanner_go_plugin.so" ]; then
+            echo "dependency_scanner_go_plugin.so found."
+          else
+            echo "::warning::dependency_scanner_go_plugin.so not found in $RBE_DIR."
+          fi
+          if [ -x "$RBE_DIR/scandeps_server" ]; then
+            echo "scandeps_server found."
+          else
+            echo "::notice::scandeps_server not found (may be absent in older reclient builds)."
+          fi
+
           echo "=== REPROXY VERSION ==="
           "$RBE_DIR/reproxy" --version || true
 
@@ -314,7 +327,9 @@ jobs:
             echo "RBE_service_no_auth=${RBE_service_no_auth}"
             echo "RBE_remote_headers=x-buildbuddy-api-key=<redacted>"
             echo "RBE_log_dir=${RBE_log_dir}"
+            echo "RBE_log_path=${RBE_log_path}"
             echo "RBE_proxy_log_dir=${RBE_proxy_log_dir}"
+            echo "RBE_v=${RBE_v}"
             echo "RBE_output_dir=${RBE_output_dir}"
             echo "NINJA_REMOTE_NUM_JOBS=${NINJA_REMOTE_NUM_JOBS}"
           } | tee /tmp/rbe-test/rbe-env.txt
@@ -369,7 +384,37 @@ jobs:
           echo "This is intentionally a clean source-output build without restored ccache."
           echo "RBE_CXX_EXEC_STRATEGY=remote makes a remote failure fatal instead of silently falling back locally."
 
+          # Capture failure without losing the real build status to tee/pipefail.
+          set +e
           m -j1 libbase 2>&1 | tee /tmp/rbe-test/real-cxx-compile.log
+          BUILD_RC=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$BUILD_RC" -ne 0 ]; then
+            echo "=== RBE COMPILE FAILED (exit $BUILD_RC) ==="
+
+            echo "=== REPROXY LOG TAIL ==="
+            if [ -s /tmp/rbe-test/reproxy_log.txt ]; then
+              tail -n 150 /tmp/rbe-test/reproxy_log.txt
+            else
+              echo "::warning::reproxy_log.txt missing or empty; listing available diagnostics."
+            fi
+
+            echo "=== RECLIENT DIAGNOSTIC FILES ==="
+            find /tmp/rbe-test -maxdepth 3 -type f \
+              -printf '%p %s bytes\n' | sort
+
+            echo "=== RECLIENT ERROR SCAN ==="
+            grep -aRinE \
+              'UNAUTHENTICATED|PERMISSION_DENIED|PermissionDenied|Unauthenticated|Unavailable|DeadlineExceeded|InvalidArgument|ResourceExhausted|ERROR|FATAL|failed|connection refused|no such file|exec format error' \
+              /tmp/rbe-test \
+              --exclude=real-cxx-compile.log \
+              --exclude=m-nothing.log \
+              2>/dev/null | head -100 || true
+
+            echo "::error::Remote-only C++ compilation failed; inspect the RBE diagnostics artifact."
+            exit "$BUILD_RC"
+          fi
 
           echo "=== RBE OUTPUT FILES ==="
           find /tmp/rbe-test \
@@ -426,6 +471,19 @@ jobs:
           echo "=== REPROXY LOG TAIL ==="
           tail -n 220 /tmp/rbe-test/reproxy_log.txt 2>/dev/null || true
 
+          echo "=== ALL AVAILABLE RECLIENT LOGS ==="
+          find /tmp/rbe-test -maxdepth 3 -type f \
+            \( -iname '*log*' -o -name '*.rpl' -o -iname '*metrics*' \) \
+            -printf '%p %s bytes\n' | sort || true
+
+          echo "=== RBE ERROR SUMMARY ==="
+          grep -aRinE \
+            'UNAUTHENTICATED|PERMISSION_DENIED|PermissionDenied|Unauthenticated|Unavailable|DeadlineExceeded|InvalidArgument|ResourceExhausted|ERROR|FATAL|failed|connection refused|no such file|exec format error' \
+            /tmp/rbe-test \
+            --exclude=real-cxx-compile.log \
+            --exclude=m-nothing.log \
+            2>/dev/null | head -100 || true
+
           echo "=== RBE METRICS ==="
           cat /tmp/rbe-test/rbe_metrics.txt 2>/dev/null || true
 
@@ -434,6 +492,28 @@ jobs:
 
           echo "=== REAL C++ BUILD LOG TAIL ==="
           tail -n 220 /tmp/rbe-test/real-cxx-compile.log 2>/dev/null || true
+
+      - name: Redact BuildBuddy API key from RBE artifacts
+        if: always()
+        shell: bash
+        run: |
+          set -e
+          python3 - <<'PYREDACT'
+          import os
+          from pathlib import Path
+
+          key = os.environ.get("BUILDBUDDY_API_KEY", "").encode()
+          root = Path("/tmp/rbe-test")
+          if key and root.is_dir():
+              for file in root.rglob("*"):
+                  if not file.is_file() or file.is_symlink():
+                      continue
+                  data = file.read_bytes()
+                  if key in data:
+                      # Preserve file length for binary diagnostic formats.
+                      file.write_bytes(data.replace(key, b"*" * len(key)))
+                      print(f"Redacted secret from: {file.relative_to(root)}")
+          PYREDACT
 
       - name: Upload RBE test logs
         if: always()
