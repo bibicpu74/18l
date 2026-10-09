@@ -267,6 +267,11 @@ jobs:
           git config --global user.name "ci"
           git config --global color.ui false
 
+          # Initialize Git LFS filters BEFORE repo init/sync. WebView prebuilts
+          # are stored as LFS objects, not regular git blobs.
+          git lfs version
+          git lfs install --skip-repo
+
           mkdir -p /home/runner/work/los
           cd /home/runner/work/los
           if [ "$RUN_MODE" = full_rom ] && [ "$OUT_STORAGE" = btrfs_zstd ]; then
@@ -276,6 +281,7 @@ jobs:
 
           repo init \
             --depth=1 \
+            --git-lfs \
             -u https://github.com/LineageOS/android.git \
             -b lineage-18.1
 
@@ -330,6 +336,83 @@ jobs:
 
           echo "=== POST-SYNC DISK ==="
           df -h / /home/runner/work/los
+
+      # The Chromium WebView APK is a Git LFS object. Without --git-lfs,
+      # the source tree may contain a ~130-byte pointer instead of an APK,
+      # causing veridex to fail at 99% with "Invalid file".
+      - name: Fetch and validate WebView arm64 Git LFS APK
+        working-directory: /home/runner/work/los
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rbe-test
+          LOG=/tmp/rbe-test/webview-lfs-check.log
+          PULL_LOG=/tmp/rbe-test/webview-lfs-pull.log
+          DIR=external/chromium-webview/prebuilt/arm64
+          APK="$DIR/webview.apk"
+
+          if [ ! -d "$DIR" ] || [ ! -f "$APK" ]; then
+            echo "::error::WebView arm64 project or APK missing: $APK"
+            exit 1
+          fi
+
+          echo '=== GIT LFS STATUS ===' | tee "$LOG"
+          git lfs version | tee -a "$LOG"
+          git -C "$DIR" lfs ls-files --long | tee -a "$LOG"
+          echo '=== APK BEFORE LFS PULL ===' | tee -a "$LOG"
+          stat -c 'size_bytes=%s file=%n' "$APK" | tee -a "$LOG"
+
+          echo '=== EXPLICIT WEBVIEW LFS FETCH AND CHECKOUT ==='
+          # Fetch only this APK from its own repo; do not guess a mirror URL
+          # or replace it with a different WebView build.
+          git -C "$DIR" lfs pull --include='webview.apk' --exclude='' \
+            2>&1 | tee "$PULL_LOG"
+          git -C "$DIR" lfs checkout webview.apk \
+            2>&1 | tee -a "$PULL_LOG"
+
+          echo '=== CHECK LFS POINTER AND FILE SIZE ===' | tee -a "$LOG"
+          python3 - "$APK" <<'PYCHECK'
+          from pathlib import Path
+          import sys
+          apk = Path(sys.argv[1])
+          with apk.open('rb') as f:
+              prefix = f.read(256)
+          if prefix.startswith(b'version https://git-lfs.github.com/spec/v1'):
+              sys.exit('ERROR: webview.apk is still a Git LFS pointer')
+          if apk.stat().st_size < 10 * 1024 * 1024:
+              sys.exit('ERROR: webview.apk is unexpectedly small (< 10 MiB)')
+          if prefix[:2] != b'PK':
+              sys.exit('ERROR: webview.apk does not have a ZIP/APK header')
+          print(f'WebView APK size: {apk.stat().st_size:,} bytes')
+          PYCHECK
+
+          # Verify archive CRCs and manifest before starting hours of build.
+          echo '=== ZIP INTEGRITY CHECK ===' | tee -a "$LOG"
+          if ! unzip -tqq "$APK"; then
+            echo "::error::WebView APK ZIP/CRC check failed: $APK"
+            exit 1
+          fi
+          if ! python3 - "$APK" <<'PYZIP'
+          from zipfile import ZipFile, BadZipFile
+          import sys
+          try:
+              with ZipFile(sys.argv[1]) as archive:
+                  if 'AndroidManifest.xml' not in archive.namelist():
+                      raise ValueError('AndroidManifest.xml is missing')
+                  print(f'WebView APK entries: {len(archive.namelist())}')
+          except (BadZipFile, ValueError) as exc:
+              sys.exit(f'WebView APK invalid: {exc}')
+          PYZIP
+          then
+            echo '::error::WebView APK manifest check failed.'
+            exit 1
+          fi
+
+          echo '=== VERIFIED WEBVIEW APK ===' | tee -a "$LOG"
+          stat -c 'size_bytes=%s file=%n' "$APK" | tee -a "$LOG"
+          sha256sum "$APK" | tee /tmp/rbe-test/webview-sha256.log | tee -a "$LOG"
+          echo 'WebView arm64 LFS APK passed integrity checks.' | tee -a "$LOG"
 
       - name: Verify and measure compressed workspace after repo sync
         working-directory: /home/runner/work/los
@@ -1512,6 +1595,10 @@ jobs:
 
           echo "=== BUILD GRAPH LOG TAIL ==="
           tail -n 160 /tmp/rbe-test/m-nothing.log 2>/dev/null || true
+
+          echo "=== WEBVIEW LFS PREFLIGHT ==="
+          cat /tmp/rbe-test/webview-lfs-check.log 2>/dev/null || true
+          cat /tmp/rbe-test/webview-sha256.log 2>/dev/null || true
 
           echo "=== FULL ROM BUILD LOG TAIL ==="
           tail -n 260 /tmp/rbe-test/full-rom-build.log 2>/dev/null || true
