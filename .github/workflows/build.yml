@@ -1,21 +1,21 @@
-name: LineageOS 18.1 - star2lte RBE / Storage Compression Experiments
+name: LineageOS 18.1 - star2lte Full ROM / Btrfs ZSTD Dual Disk Monitor
 
 on:
   workflow_dispatch:
     inputs:
       run_mode:
-        description: "Run benchmark first or build the complete ROM"
+        description: "Build complete ROM by default; or run compression benchmark"
         type: choice
         required: true
-        default: benchmark
+        default: full_rom
         options:
           - benchmark
           - full_rom
       out_storage:
-        description: "Full ROM only: optional experimental Btrfs ZSTD out/"
+        description: "Full ROM output: experimental compressed Btrfs (default) or plain"
         type: choice
         required: true
-        default: plain
+        default: btrfs_zstd
         options:
           - plain
           - btrfs_zstd
@@ -67,6 +67,10 @@ jobs:
       # Warning at 15 GiB; experimental hard stop at 7 GiB (higher risk).
       DISK_WARN_GIB: "15"
       DISK_STOP_GIB: "7"
+      # Root filesystem AND Btrfs out/ must independently have at least 7 GiB.
+      # Compare sparse backing image allocated blocks, never apparent image size.
+      BTRFS_LOGICAL_SCAN_SECONDS: "120"
+      BTRFS_LOGICAL_SCAN_TIMEOUT_SECONDS: "20"
       # Stop the long build early enough to upload logs and a successful ROM.
       # Whole-job limit on GitHub-hosted runners: 360 minutes.
       FULL_ROM_SOFT_DEADLINE_MINUTES: "320"
@@ -507,6 +511,8 @@ jobs:
           mkdir -p /tmp/rbe-test
           OUT="$PWD/out"
           BACKING=/tmp/lineage-out-btrfs.img
+          # The image is located on the root filesystem. It is sparse, so
+          # the outer df (not just Btrfs df) remains the physical space guard.
           mkdir -p "$OUT"
           if mountpoint -q "$OUT" || [ -n "$(ls -A "$OUT")" ]; then
             echo '::error::Refusing to hide an existing or nonempty out/ directory.'
@@ -527,6 +533,13 @@ jobs:
             df -hT / "$OUT"
             mount | grep -F "$OUT" || true
           } | tee /tmp/rbe-test/out-btrfs-setup-summary.log
+          printf 'timestamp\tstage\troot_available_bytes\troot_used_bytes\tbtrfs_available_bytes\tbtrfs_used_bytes\tbacking_allocated_bytes\tbacking_apparent_bytes\tout_apparent_bytes\tlogical_scan_age_seconds\n' \
+            > /tmp/rbe-test/btrfs-storage-samples.tsv
+          echo '=== ROOT VS BTRFS (INITIAL) ==='
+          df -hT / "$OUT"
+          echo '=== SPARSE IMAGE (ALLOCATED VS LOGICAL) ==='
+          du -h "$BACKING"
+          ls -lh "$BACKING"
 
       - name: Install compatible reclient 0.57.0 (pinned AOSP)
         working-directory: /home/runner/work/los
@@ -818,16 +831,85 @@ jobs:
               "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$stage" "$available" "$used" "$mem" >> "$DISK_SAMPLES"
             printf '%s\n' "$available"
           }
+          # A filesystem-in-filesystem has two independent ENOSPC conditions.
+          # Root df tracks actual remaining host disk, while df out/ tracks
+          # logical space that Btrfs itself can still allocate.
+          BTRFS_OUT="$PWD/out"
+          BTRFS_BACKING=/tmp/lineage-out-btrfs.img
+          BTRFS_TSV=/tmp/rbe-test/btrfs-storage-samples.tsv
+          BTRFS_ACTIVE=0
+          if [ "$RUN_MODE" = full_rom ] && [ "$OUT_STORAGE" = btrfs_zstd ]; then
+            if ! mountpoint -q "$BTRFS_OUT" || \
+               [ "$(stat -f -c %T "$BTRFS_OUT")" != btrfs ] || \
+               [ ! -f "$BTRFS_BACKING" ]; then
+              echo '::error::Btrfs requested but out/ is not a mounted Btrfs filesystem with a backing image.'
+              exit 1
+            fi
+            BTRFS_ACTIVE=1
+            if [ ! -s "$BTRFS_TSV" ]; then
+              printf 'timestamp\tstage\troot_available_bytes\troot_used_bytes\tbtrfs_available_bytes\tbtrfs_used_bytes\tbacking_allocated_bytes\tbacking_apparent_bytes\tout_apparent_bytes\tlogical_scan_age_seconds\n' > "$BTRFS_TSV"
+            fi
+          fi
+          LAST_OUT_APPARENT_BYTES=-1
+          LAST_OUT_SCAN_ATTEMPT_EPOCH=0
+          LAST_OUT_SCAN_SUCCESS_EPOCH=0
+          BTRFS_SCAN_ERR=/tmp/rbe-test/btrfs-out-logical-scan-errors.log
+          : > "$BTRFS_SCAN_ERR"
+
+          # du --apparent-size sums logical file lengths. Scanning a very large
+          # active out/ tree is expensive, so cap time to 20s and scan at most
+          # every 120s. Fast df/du(backing image) runs every 5-30s.
+          btrfs_sample() {
+            local stage="$1" do_logical="${2:-no}" now root_avail root_used inner_avail inner_used backing_alloc backing_size age measured
+            [ "$BTRFS_ACTIVE" -eq 1 ] || return 0
+            now="$(date +%s)"
+            root_avail="$(df -B1 --output=avail / | tail -n 1 | tr -d ' ')"
+            root_used="$(df -B1 --output=used / | tail -n 1 | tr -d ' ')"
+            inner_avail="$(df -B1 --output=avail "$BTRFS_OUT" | tail -n 1 | tr -d ' ')"
+            inner_used="$(df -B1 --output=used "$BTRFS_OUT" | tail -n 1 | tr -d ' ')"
+            backing_alloc="$(du -sB1 "$BTRFS_BACKING" | awk '{print $1}')"
+            backing_size="$(stat -c %s "$BTRFS_BACKING")"
+            if [ "$do_logical" = yes ] && \
+               (( now - LAST_OUT_SCAN_ATTEMPT_EPOCH >= BTRFS_LOGICAL_SCAN_SECONDS )); then
+              LAST_OUT_SCAN_ATTEMPT_EPOCH="$now"
+              if measured="$(timeout "${BTRFS_LOGICAL_SCAN_TIMEOUT_SECONDS}s" \
+                  nice -n 15 ionice -c 3 du -sB1 --apparent-size "$BTRFS_OUT" 2>> "$BTRFS_SCAN_ERR" | awk '{print $1}')" \
+                 && [[ "$measured" =~ ^[0-9]+$ ]]; then
+                LAST_OUT_APPARENT_BYTES="$measured"
+                LAST_OUT_SCAN_SUCCESS_EPOCH="$(date +%s)"
+              else
+                echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') out/ logical-size scan failed or timed out; retaining previous value" >> "$BTRFS_SCAN_ERR"
+              fi
+            fi
+            age=-1
+            if [ "$LAST_OUT_APPARENT_BYTES" -ge 0 ]; then
+              age=$((now - LAST_OUT_SCAN_SUCCESS_EPOCH))
+            fi
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+              "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$stage" "$root_avail" "$root_used" \
+              "$inner_avail" "$inner_used" "$backing_alloc" "$backing_size" \
+              "$LAST_OUT_APPARENT_BYTES" "$age" >> "$BTRFS_TSV"
+            echo "BTRFS_STORAGE root_free=$((root_avail/1073741824))GiB inner_free=$((inner_avail/1073741824))GiB backing_alloc=$((backing_alloc/1048576))MiB out_apparent=$((LAST_OUT_APPARENT_BYTES/1048576))MiB" | tee -a /tmp/rbe-test/resource-monitor.log
+          }
           enforce_initial_disk_guard() {
-            local stage="$1" available threshold
+            local stage="$1" available threshold inner_avail
             available="$(disk_sample "$stage")"
             threshold=$((DISK_STOP_GIB * 1024 * 1024 * 1024))
             if (( available < threshold )); then
-              echo "::error::Available disk below ${DISK_STOP_GIB} GiB at ${stage}; refusing to start/continue build."
-              df -h /home/runner/work/los
+              echo "::error::Root disk below ${DISK_STOP_GIB} GiB at ${stage}."
+              df -h / "$BTRFS_OUT"
               exit 1
             fi
-            echo "=== DISK AT ${stage}: $((available / 1073741824)) GiB free ==="
+            if [ "$BTRFS_ACTIVE" -eq 1 ]; then
+              inner_avail="$(df -B1 --output=avail "$BTRFS_OUT" | tail -n 1 | tr -d ' ')"
+              if (( inner_avail < threshold )); then
+                echo "::error::Btrfs out/ below ${DISK_STOP_GIB} GiB at ${stage}."
+                df -h / "$BTRFS_OUT"
+                exit 1
+              fi
+              btrfs_sample "$stage" yes
+            fi
+            echo "=== DISK AT ${stage}: $((available / 1073741824)) GiB free on host ==="
           }
           enforce_initial_disk_guard pre-graph
 
@@ -1070,21 +1152,41 @@ jobs:
           }
           trap cleanup_build_supervisor EXIT
 
-          echo '=== FULL ROM STORAGE / MEMORY / TIME MONITOR (30s; 5s under 15 GiB) ==='
+          echo '=== FULL ROM DUAL STORAGE / MEMORY / TIME MONITOR (30s; 5s near disk limit) ==='
           : > /tmp/rbe-test/resource-monitor.log
           WARNED=0
+          INNER_WARNED=0
           while kill -0 "$BUILD_PID" 2>/dev/null; do
             avail="$(disk_sample full-rom-sample)"
             now="$(date +%s)"
             free_gib=$((avail / 1073741824))
             mem_kib="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
             seconds_left=$((SOFT_DEADLINE_EPOCH - now))
-            line="$(date -u +'%Y-%m-%dT%H:%M:%SZ') free=${free_gib}GiB mem_available=${mem_kib}KiB soft_deadline_remaining=${seconds_left}s"
+            inner_avail=-1
+            inner_free_gib=-1
+            if [ "$BTRFS_ACTIVE" -eq 1 ]; then
+              if ! mountpoint -q "$BTRFS_OUT"; then
+                echo 'Btrfs out/ unexpectedly unmounted; refusing to build into uncovered path' | tee "$DISK_TRIP_FILE"
+                echo '::error::Btrfs out/ mount was lost.'
+                stop_process_tree "$BUILD_PID"
+                break
+              fi
+              # Always test inner free space before the expensive logical-size scan.
+              inner_avail="$(df -B1 --output=avail "$BTRFS_OUT" | tail -n 1 | tr -d ' ')"
+              inner_free_gib=$((inner_avail / 1073741824))
+            fi
+            line="$(date -u +'%Y-%m-%dT%H:%M:%SZ') root_free=${free_gib}GiB btrfs_free=${inner_free_gib}GiB mem_available=${mem_kib}KiB soft_deadline_remaining=${seconds_left}s"
             echo "$line" | tee -a /tmp/rbe-test/resource-monitor.log
 
             if (( avail < DISK_STOP_GIB * 1073741824 )); then
-              echo "Disk safety stop: available below ${DISK_STOP_GIB} GiB" | tee "$DISK_TRIP_FILE"
-              echo "::error::Insufficient disk space; stopping full ROM build."
+              echo "Root disk safety stop: available below ${DISK_STOP_GIB} GiB" | tee "$DISK_TRIP_FILE"
+              echo "::error::Host filesystem is running out of space; stopping full ROM build."
+              stop_process_tree "$BUILD_PID"
+              break
+            fi
+            if [ "$BTRFS_ACTIVE" -eq 1 ] && (( inner_avail < DISK_STOP_GIB * 1073741824 )); then
+              echo "Btrfs out/ safety stop: available below ${DISK_STOP_GIB} GiB" | tee "$DISK_TRIP_FILE"
+              echo "::error::Btrfs filesystem is running out of space; stopping full ROM build."
               stop_process_tree "$BUILD_PID"
               break
             fi
@@ -1095,13 +1197,29 @@ jobs:
               break
             fi
             if (( avail < DISK_WARN_GIB * 1073741824 && WARNED == 0 )); then
-              echo "::warning::Less than ${DISK_WARN_GIB} GiB remains; full ROM build may be stopped."
+              echo "::warning::Host filesystem is below ${DISK_WARN_GIB} GiB free."
               WARNED=1
             fi
-            # At low disk, sample every 5 seconds so a 7 GiB guard
-            # has less chance to be overtaken by rapidly growing output.
+            if [ "$BTRFS_ACTIVE" -eq 1 ] && (( inner_avail < DISK_WARN_GIB * 1073741824 && INNER_WARNED == 0 )); then
+              echo "::warning::Btrfs out/ is below ${DISK_WARN_GIB} GiB free."
+              INNER_WARNED=1
+            fi
+            if [ "$BTRFS_ACTIVE" -eq 1 ]; then
+              # Measure sparse allocated backing space every tick. Skip the
+              # potentially slow logical tree scan near the 7 GiB stop limit
+              # so the 5-second safety checks remain responsive.
+              LOGICAL_SCAN=yes
+              if (( avail < 15 * 1073741824 )) || \
+                 (( inner_avail < 15 * 1073741824 )); then
+                LOGICAL_SCAN=no
+              fi
+              btrfs_sample full-rom-sample "$LOGICAL_SCAN"
+            fi
             SLEEP_TICKS=6
-            if (( avail < 15 * 1073741824 )); then SLEEP_TICKS=1; fi
+            if (( avail < 15 * 1073741824 )) || \
+               { [ "$BTRFS_ACTIVE" -eq 1 ] && (( inner_avail < 15 * 1073741824 )); }; then
+              SLEEP_TICKS=1
+            fi
             for ((tick=0; tick<SLEEP_TICKS; tick++)); do
               kill -0 "$BUILD_PID" 2>/dev/null || break
               sleep 5
@@ -1120,6 +1238,14 @@ jobs:
           if [ -s "$DISK_TRIP_FILE" ]; then BUILD_RC=70; fi
           if [ -s "$TIME_TRIP_FILE" ]; then BUILD_RC=71; fi
           disk_sample post-full-rom-build >/dev/null
+          if [ "$BTRFS_ACTIVE" -eq 1 ]; then
+            btrfs_sample post-full-rom-build yes || true
+            echo '=== BTRFS STORAGE FINAL DETAIL ==='
+            df -hT / "$BTRFS_OUT" || true
+            sudo btrfs filesystem usage -b "$BTRFS_OUT" \
+              > /tmp/rbe-test/btrfs-filesystem-usage-final.log 2>&1 || true
+            cat /tmp/rbe-test/btrfs-filesystem-usage-final.log || true
+          fi
           echo "=== FULL ROM BUILD EXIT: $BUILD_RC ==="
 
           if [ "$BUILD_RC" -ne 0 ]; then
@@ -1195,7 +1321,26 @@ jobs:
               echo '| No measurements | — | — | — |'
             fi
             echo ''
-            echo "Disk guard: warning under ${DISK_WARN_GIB} GiB; safe stop under ${DISK_STOP_GIB} GiB."
+            echo "Disk guard: warning under ${DISK_WARN_GIB} GiB; safe stop under ${DISK_STOP_GIB} GiB (host and Btrfs independently)."
+            if [ -s /tmp/rbe-test/btrfs-storage-samples.tsv ]; then
+              echo ''
+              echo '### Btrfs compression: logical out/ versus physical backing image'
+              echo '| Point | Host free GiB | Btrfs free GiB | Backing allocated GiB | out/ logical GiB |'
+              echo '|---|---:|---:|---:|---:|'
+              awk -F '\t' 'NR>1 && NF>=10 {
+                count++;
+                if (count==1) first=$0;
+                last=$0;
+                if (count%20==0) extras[count]=$0;
+              } END {
+                if (count>0) {
+                  n=split(first,f,"\t"); printf "| %s | %.2f | %.2f | %.2f | %s |\n", f[2],f[3]/1073741824,f[5]/1073741824,f[7]/1073741824,(f[9]>=0?sprintf("%.2f",f[9]/1073741824):"not sampled");
+                  if (count>1) {split(last,l,"\t"); printf "| %s | %.2f | %.2f | %.2f | %s |\n",l[2],l[3]/1073741824,l[5]/1073741824,l[7]/1073741824,(l[9]>=0?sprintf("%.2f",l[9]/1073741824):"not sampled");}
+                }
+              }' /tmp/rbe-test/btrfs-storage-samples.tsv
+              echo ''
+              echo 'The sparse image allocated size is host disk blocks; out/ logical size sums file lengths (not comparable to Btrfs metadata). Full time series is in the artifact.'
+            fi
             if [ -s /tmp/rbe-test/disk-stop-triggered.txt ]; then
               echo '**Guard triggered: build terminated due to low disk.**'
             fi
@@ -1307,6 +1452,14 @@ jobs:
           tail -n 30 /tmp/rbe-test/resource-samples.tsv 2>/dev/null || true
           echo "=== RESOURCE MONITOR ==="
           tail -n 60 /tmp/rbe-test/resource-monitor.log 2>/dev/null || true
+          echo '=== BTRFS DUAL STORAGE (LAST 25 SAMPLES) ==='
+          tail -n 25 /tmp/rbe-test/btrfs-storage-samples.tsv 2>/dev/null || true
+          echo '=== BTRFS LOGICAL SCAN WARNINGS ==='
+          tail -n 20 /tmp/rbe-test/btrfs-out-logical-scan-errors.log 2>/dev/null || true
+          echo '=== BTRFS FILESYSTEM USAGE ==='
+          cat /tmp/rbe-test/btrfs-filesystem-usage-final.log 2>/dev/null || true
+          echo '=== SPARSE BACKING ALLOCATION ==='
+          du -h /tmp/lineage-out-btrfs.img 2>/dev/null || true
 
           echo '=== PREBUILTS LARGEST DIRECTORIES ==='
           tail -n 25 /tmp/rbe-test/prebuilts-detail.log 2>/dev/null || true
