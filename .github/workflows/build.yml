@@ -1,4 +1,4 @@
-name: LineageOS 18.1 - BuildBuddy RBE + Deep Storage Profile
+name: LineageOS 18.1 - star2lte Full ROM Trial (BuildBuddy RBE)
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: los18-star2lte-rbe-real-test
+  group: los18-star2lte-rbe-full-rom-trial
   cancel-in-progress: true
 
 jobs:
@@ -40,7 +40,7 @@ jobs:
       RBE_reproxy_wait_seconds: "30"
       RBE_v: "2"
 
-      # Conservative 2-job parallel remote compilation on GitHub hosted runner.
+      # Conservative 2-job build parallelism on GitHub hosted runner.
       # Keep memory-intensive actions serial to reduce local memory pressure.
       NINJA_REMOTE_NUM_JOBS: "2"
       NINJA_HIGHMEM_NUM_JOBS: "1"
@@ -48,6 +48,9 @@ jobs:
       # GiB of available disk space (statvfs/df -B1, not rounded df -h).
       DISK_WARN_GIB: "25"
       DISK_STOP_GIB: "15"
+      # Stop the long build early enough to upload logs and a successful ROM.
+      # Whole-job limit on GitHub-hosted runners: 360 minutes.
+      FULL_ROM_SOFT_DEADLINE_MINUTES: "320"
 
     steps:
       - name: Reclaim root disk
@@ -66,6 +69,8 @@ jobs:
           sudo docker image prune -a -f >/dev/null 2>&1 || true
 
           mkdir -p /home/runner/work/los /tmp/rbe-test
+          # Start the total-job clock before dependency install and repo sync.
+          date +%s > /tmp/rbe-test/job-start-epoch.txt
 
           echo "=== DISK ==="
           df -h /
@@ -130,7 +135,8 @@ jobs:
             ninja-build \
             nginx \
             ca-certificates \
-            openssl
+            openssl \
+            unzip
 
           mkdir -p "$HOME/bin"
           curl -fsSL \
@@ -552,11 +558,10 @@ jobs:
           echo "::error::BuildBuddy gRPC bridge failed to start."
           exit 1
 
-      - name: Configure Lineage and run real RBE C++ compile
+      - name: Configure Lineage and build full star2lte ROM via BuildBuddy
         working-directory: /home/runner/work/los
-        # First successful remote executions reached 98% before the 45-minute limit.
-        # Allow the remote-only libbase correctness test to finish.
-        timeout-minutes: 180
+        # The 320-minute job-clock guard below leaves time for cleanup/upload.
+        timeout-minutes: 325
         shell: bash
         run: |
           set -eo pipefail
@@ -571,6 +576,19 @@ jobs:
           fi
           source build/envsetup.sh
           lunch lineage_star2lte-userdebug
+
+          # Use the checked-out JDK 11 for Android 11 host Java build stages.
+          # RBE and Android Soong toolchain remain otherwise unchanged.
+          if [ -x "$PWD/prebuilts/jdk/jdk11/linux-x86/bin/java" ]; then
+            export JAVA_HOME="$PWD/prebuilts/jdk/jdk11/linux-x86"
+            export PATH="$JAVA_HOME/bin:$PATH"
+          else
+            echo "::warning::Bundled JDK 11 is not present at expected path; build system will select its default JDK."
+          fi
+          export USE_CCACHE=0
+          export CCACHE_DISABLE=1
+          echo "=== JAVA VERSION ==="
+          java -version 2>&1 || true
 
           echo "=== LINEAGE BUILD SELECTION ==="
           echo "ANDROID_BUILD_TOP=${ANDROID_BUILD_TOP:-unset}"
@@ -714,32 +732,42 @@ jobs:
           test -x "$RBE_DIR/rewrapper"
           test -x "$RBE_DIR/reproxy"
 
-          echo "=== REAL C++ BUILD: libbase ==="
-          echo "This is intentionally a clean source-output build without restored ccache."
-          echo "RBE_CXX_EXEC_STRATEGY=remote makes a remote failure fatal instead of silently falling back locally."
-
+          echo "=== FULL ROM BUILD: star2lte / bacon ==="
+          echo "RBE remote-only enabled; jobs=2, highmem=1, no local ccache."
+          echo "The previous libbase test passed; this run compiles and packages the full ROM."
           enforce_initial_disk_guard pre-build
 
-          # Run the same tested m -j2 libbase pipeline in a subshell so the
-          # parent can sample resources and stop its process tree on low disk.
-          # Keep the existing reclient, BuildBuddy bridge, and remote-only mode.
-          echo "NINJA_REMOTE_NUM_JOBS=${NINJA_REMOTE_NUM_JOBS}; NINJA_HIGHMEM_NUM_JOBS=${NINJA_HIGHMEM_NUM_JOBS}; build jobs=2"
+          BUILD_LOG=/tmp/rbe-test/full-rom-build.log
           BUILD_STATUS_FILE=/tmp/rbe-test/build-exit-code.txt
           DISK_TRIP_FILE=/tmp/rbe-test/disk-stop-triggered.txt
-          rm -f "$BUILD_STATUS_FILE" "$DISK_TRIP_FILE"
+          TIME_TRIP_FILE=/tmp/rbe-test/time-stop-triggered.txt
+          rm -f "$BUILD_STATUS_FILE" "$DISK_TRIP_FILE" "$TIME_TRIP_FILE"
 
+          if [ -s /tmp/rbe-test/job-start-epoch.txt ]; then
+            JOB_START_EPOCH="$(cat /tmp/rbe-test/job-start-epoch.txt)"
+          else
+            JOB_START_EPOCH="$(date +%s)"
+          fi
+          SOFT_DEADLINE_EPOCH=$(( JOB_START_EPOCH + FULL_ROM_SOFT_DEADLINE_MINUTES * 60 ))
+          echo "=== SOFT DEADLINE (UTC) ==="
+          date -u -d "@$SOFT_DEADLINE_EPOCH" +'%Y-%m-%dT%H:%M:%SZ'
+          if (( $(date +%s) >= SOFT_DEADLINE_EPOCH )); then
+            echo "::error::Not enough job time remains to begin full ROM build."
+            exit 71
+          fi
+
+          # Run the build in a child shell and keep its exit status after tee.
+          # The supervisor retains control to stop on low disk/time.
           (
             set +e
             set -o pipefail
-            m -j2 libbase 2>&1 | tee /tmp/rbe-test/real-cxx-compile.log
+            m -j2 bacon 2>&1 | tee "$BUILD_LOG"
             rc=${PIPESTATUS[0]}
             printf '%s\n' "$rc" > "$BUILD_STATUS_FILE"
             exit "$rc"
           ) &
           BUILD_PID=$!
 
-          # Terminate children before parents so Ninja/Soong cannot keep using
-          # disk after the supervisor has decided to stop.
           stop_process_tree() {
             local pid="$1" child
             while IFS= read -r child; do
@@ -755,28 +783,36 @@ jobs:
           }
           trap cleanup_build_supervisor EXIT
 
-          echo '=== 60-SECOND STORAGE / MEMORY MONITOR ==='
+          echo '=== FULL ROM STORAGE / MEMORY / TIME MONITOR (30s) ==='
           : > /tmp/rbe-test/resource-monitor.log
           WARNED=0
           while kill -0 "$BUILD_PID" 2>/dev/null; do
-            avail="$(disk_sample build-sample)"
+            avail="$(disk_sample full-rom-sample)"
+            now="$(date +%s)"
             free_gib=$((avail / 1073741824))
             mem_kib="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
-            line="$(date -u +'%Y-%m-%dT%H:%M:%SZ') free=${free_gib}GiB mem_available=${mem_kib}KiB"
+            seconds_left=$((SOFT_DEADLINE_EPOCH - now))
+            line="$(date -u +'%Y-%m-%dT%H:%M:%SZ') free=${free_gib}GiB mem_available=${mem_kib}KiB soft_deadline_remaining=${seconds_left}s"
             echo "$line" | tee -a /tmp/rbe-test/resource-monitor.log
+
             if (( avail < DISK_STOP_GIB * 1073741824 )); then
               echo "Disk safety stop: available below ${DISK_STOP_GIB} GiB" | tee "$DISK_TRIP_FILE"
-              echo "::error::Low disk detected; stopping m -j2 libbase to avoid filling runner root."
+              echo "::error::Insufficient disk space; stopping full ROM build."
+              stop_process_tree "$BUILD_PID"
+              break
+            fi
+            if (( now >= SOFT_DEADLINE_EPOCH )); then
+              echo "Time safety stop: passed ${FULL_ROM_SOFT_DEADLINE_MINUTES} minute whole-job deadline" | tee "$TIME_TRIP_FILE"
+              echo "::error::Stopping build before the 6-hour GitHub job limit to preserve diagnostics."
               stop_process_tree "$BUILD_PID"
               break
             fi
             if (( avail < DISK_WARN_GIB * 1073741824 && WARNED == 0 )); then
-              echo "::warning::Disk below ${DISK_WARN_GIB} GiB; keep watching free space."
+              echo "::warning::Less than ${DISK_WARN_GIB} GiB remains; full ROM build may be stopped."
               WARNED=1
             fi
-            # Sample every 60 seconds, but check whether the build ended
-            # every 5 seconds to avoid a needless final one-minute delay.
-            for ((tick=0; tick<12; tick++)); do
+            # Wait up to 30 seconds without delaying a completed build.
+            for ((tick=0; tick<6; tick++)); do
               kill -0 "$BUILD_PID" 2>/dev/null || break
               sleep 5
             done
@@ -791,78 +827,55 @@ jobs:
           if [ -s "$BUILD_STATUS_FILE" ]; then
             BUILD_RC="$(cat "$BUILD_STATUS_FILE")"
           fi
-          if [ -s "$DISK_TRIP_FILE" ]; then
-            BUILD_RC=70
-            echo "::error::Build stopped by disk safety guard; see resource-monitor.log."
-          fi
-          disk_sample post-build >/dev/null
-          echo "=== BUILD EXIT CODE: $BUILD_RC ==="
+          if [ -s "$DISK_TRIP_FILE" ]; then BUILD_RC=70; fi
+          if [ -s "$TIME_TRIP_FILE" ]; then BUILD_RC=71; fi
+          disk_sample post-full-rom-build >/dev/null
+          echo "=== FULL ROM BUILD EXIT: $BUILD_RC ==="
 
           if [ "$BUILD_RC" -ne 0 ]; then
-            echo "=== RBE COMPILE FAILED (exit $BUILD_RC) ==="
-
-            echo "=== REPROXY LOG TAIL ==="
-            if [ -s /tmp/rbe-test/reproxy_log.txt ]; then
-              tail -n 150 /tmp/rbe-test/reproxy_log.txt
-            else
-              echo "::warning::reproxy_log.txt missing or empty; listing available diagnostics."
-            fi
-
-            echo "=== REMOTE ACTION WORKING DIR / OUTPUT MAPPINGS ==="
-            find /tmp/rbe-test -maxdepth 1 -name '*.rpl' -size +0c -print \
-              -exec grep -aE 'working_directory:|output_files:|status: ' {} \; \
-              | tail -n 80 || true
-
-            echo "=== RECLIENT DIAGNOSTIC FILES ==="
-            find /tmp/rbe-test -maxdepth 3 -type f \
-              -printf '%p %s bytes\n' | sort
-
-            echo "=== RECLIENT ERROR SCAN ==="
-            grep -aRinE \
-              'UNAUTHENTICATED|PERMISSION_DENIED|PermissionDenied|Unauthenticated|Unavailable|DeadlineExceeded|InvalidArgument|working_directory|input root|ResourceExhausted|ERROR|FATAL|failed|connection refused|no such file|exec format error' \
-              /tmp/rbe-test \
-              --exclude=real-cxx-compile.log \
-              --exclude=m-nothing.log \
-              2>/dev/null | head -100 || true
-
-            echo "::error::Remote-only C++ compilation failed; inspect the RBE diagnostics artifact."
+            echo '=== BUILD ERROR LINES (LAST 120 MATCHES) ==='
+            grep -anE '(^FAILED:|(^|[[:space:]])error:|No space left on device|Killed|ninja failed|out of memory|missing depfile)' "$BUILD_LOG" 2>/dev/null | tail -n 120 || true
+            echo '=== FULL ROM BUILD LOG TAIL ==='
+            tail -n 200 "$BUILD_LOG" 2>/dev/null || true
+            echo '=== REPROXY STDERR TAIL ==='
+            tail -n 100 /tmp/rbe-test/reproxy_outerr.log 2>/dev/null || true
+            echo "::error::Full ROM build did not complete (exit $BUILD_RC). See attached diagnostics."
             exit "$BUILD_RC"
           fi
 
-          echo "=== VERIFY REMOTE OBJECT WAS RETURNED ==="
-          CRT_OBJ="$ANDROID_BUILD_TOP/out/soong/.intermediates/bionic/libc/crtbegin_so1/android_arm64_armv8-a_cortex-a53/obj/bionic/libc/arch-common/bionic/crtbegin_so.o"
-          if [ ! -s "$CRT_OBJ" ]; then
-            echo "::error::Remote compile completed but local crtbegin_so.o is missing: $CRT_OBJ"
+          # A successful Ninja exit alone is not enough: verify flashable ZIP.
+          ROM_DIR="$ANDROID_BUILD_TOP/out/target/product/star2lte"
+          echo "=== ROM OUTPUT DIRECTORY ==="
+          ls -lah "$ROM_DIR" | tail -n 45
+          mapfile -d '' -t ROM_ZIPS < <(find "$ROM_DIR" -maxdepth 1 -type f -name 'lineage-*.zip' -print0)
+          if (( ${#ROM_ZIPS[@]} == 0 )); then
+            echo "::error::bacon succeeded but no lineage-*.zip found in $ROM_DIR"
             exit 1
           fi
-          ls -lh "$CRT_OBJ"
-
-          echo "=== RBE OUTPUT FILES ==="
-          find /tmp/rbe-test \
-            -maxdepth 2 \
-            -type f \
-            -printf '%p %s bytes\n' \
-            | sort \
-            | tee /tmp/rbe-test/rbe-files.txt
-
-          echo "=== RBE METRICS ==="
-          if [ -s /tmp/rbe-test/rbe_metrics.txt ]; then
-            cat /tmp/rbe-test/rbe_metrics.txt
-          else
-            echo "::warning::rbe_metrics.txt was not produced by this reclient version."
+          ROM_ZIP="${ROM_ZIPS[0]}"
+          if (( ${#ROM_ZIPS[@]} > 1 )); then
+            ROM_ZIP="$(find "$ROM_DIR" -maxdepth 1 -type f -name 'lineage-*.zip' -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)"
           fi
-
-          echo "=== RBE ERROR SCAN ==="
-          grep -R -n -E \
-            'Unauthenticated|PermissionDenied|PERMISSION_DENIED|UNAUTHENTICATED|credential|authentication|FAILED|FATAL|ERROR' \
-            /tmp/rbe-test \
-            --exclude='real-cxx-compile.log' \
-            --exclude='m-nothing.log' \
-            2>/dev/null | head -200 || true
-
-          echo "=== RBE TEST PASSED ==="
+          test -s "$ROM_ZIP"
+          echo "ROM_ZIP=$ROM_ZIP"
+          ls -lh "$ROM_ZIP"
+          echo "=== CHECK ROM ZIP INTEGRITY ==="
+          unzip -tq "$ROM_ZIP" | tail -n 8
+          sha256sum "$ROM_ZIP" | tee /tmp/rbe-test/rom-sha256.txt
+          basename "$ROM_ZIP" > /tmp/rbe-test/rom-filename.txt
+          echo "=== FULL ROM BUILD PASSED ==="
           echo "Lineage product: ${TARGET_PRODUCT}-${TARGET_BUILD_VARIANT}"
-          echo "Real C++ module build completed with RBE_CXX_EXEC_STRATEGY=remote."
+          echo 'Full bacon target completed with remote C++ compilation enabled.'
+
+      - name: Upload completed LineageOS ROM
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lineage-18.1-star2lte-${{ github.run_id }}
+          path: /home/runner/work/los/out/target/product/star2lte/lineage-*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
 
       - name: Summarize storage measurements
         if: always()
@@ -872,7 +885,7 @@ jobs:
           mkdir -p /tmp/rbe-test
           FILE=/tmp/rbe-test/resource-samples.tsv
           {
-            echo '## LineageOS 18.1 storage profile'
+            echo '## LineageOS 18.1 full ROM trial — disk and RAM'
             echo ''
             echo '| Stage (UTC) | Free GiB | Used GiB | RAM available GiB |'
             echo '|---|---:|---:|---:|'
@@ -881,7 +894,7 @@ jobs:
               awk -F '\t' 'NR>1 && NF>=5 {
                 free=$3/1073741824; used=$4/1073741824; ram=$5/1048576;
                 if (!seen || free<min) {min=free; low=$2 " " $1};
-                if ($2!="build-sample") printf "| %s: %s | %.1f | %.1f | %.1f |\n",$2,$1,free,used,ram;
+                if ($2!="build-sample" && $2!="full-rom-sample") printf "| %s: %s | %.1f | %.1f | %.1f |\n",$2,$1,free,used,ram;
                 seen=1
               } END {
                 if(seen) printf "\nLowest observed free disk: **%.1f GiB** at %s.\n",min,low;
@@ -946,7 +959,21 @@ jobs:
             else
               echo 'No prebuilts manifest project list was captured.'
             fi
-            echo 'Diagnostic only; nothing was removed from the source tree.'
+            echo 'Storage profiling did not modify source or Git objects.'
+            echo ''
+            echo '### ROM output'
+            if [ -s /tmp/rbe-test/rom-filename.txt ]; then
+              echo "ROM ZIP: **$(cat /tmp/rbe-test/rom-filename.txt)**"
+              echo ''
+              echo '```text'
+              cat /tmp/rbe-test/rom-sha256.txt 2>/dev/null || true
+              echo '```'
+            else
+              echo 'No verified ROM ZIP created in this run.'
+            fi
+            if [ -s /tmp/rbe-test/time-stop-triggered.txt ]; then
+              echo '**Soft job deadline triggered; build stopped to retain diagnostics.**'
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
           echo '=== FINAL DISK AND MEMORY ==='
           df -h / /home/runner/work/los || true
@@ -1015,7 +1042,7 @@ jobs:
           grep -aRinE \
             'UNAUTHENTICATED|PERMISSION_DENIED|PermissionDenied|Unauthenticated|Unavailable|DeadlineExceeded|InvalidArgument|working_directory|input root|ResourceExhausted|ERROR|FATAL|failed|connection refused|no such file|exec format error' \
             /tmp/rbe-test \
-            --exclude=real-cxx-compile.log \
+            --exclude=full-rom-build.log \
             --exclude=m-nothing.log \
             2>/dev/null | head -100 || true
 
@@ -1025,8 +1052,13 @@ jobs:
           echo "=== BUILD GRAPH LOG TAIL ==="
           tail -n 160 /tmp/rbe-test/m-nothing.log 2>/dev/null || true
 
-          echo "=== REAL C++ BUILD LOG TAIL ==="
-          tail -n 220 /tmp/rbe-test/real-cxx-compile.log 2>/dev/null || true
+          echo "=== FULL ROM BUILD LOG TAIL ==="
+          tail -n 260 /tmp/rbe-test/full-rom-build.log 2>/dev/null || true
+          echo "=== BUILD STOP REASONS ==="
+          cat /tmp/rbe-test/*-stop-triggered.txt 2>/dev/null || true
+          echo "=== ROM ZIP FILES IF PRESENT ==="
+          find /home/runner/work/los/out/target/product/star2lte -maxdepth 1 \
+            -type f -name 'lineage-*.zip' -printf '%p %s bytes\n' 2>/dev/null || true
 
       - name: Stop BuildBuddy gRPC bridge and remove credentials
         if: always()
@@ -1062,7 +1094,7 @@ jobs:
                       print(f"Redacted secret from: {file.relative_to(root)}")
           PYREDACT
 
-      - name: Upload RBE test logs
+      - name: Upload full ROM trial diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
