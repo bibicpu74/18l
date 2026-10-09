@@ -145,6 +145,44 @@ jobs:
           chmod a+x "$HOME/bin/repo"
           echo "$HOME/bin" >> "$GITHUB_PATH"
 
+      # Ubuntu 24.04 does not ship libncurses.so.5. Android 11's old
+      # RenderScript Clang (clang-3289846) still links against SONAME 5.
+      # Fetch ONLY the two matching Jammy legacy runtimes, verify official
+      # Ubuntu SHA-256 sums, and install without replacing system ncurses6.
+      - name: Install legacy ncurses5 for Android 11 RenderScript
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION='6.3-2ubuntu0.3'
+          BASE='https://security.ubuntu.com/ubuntu/pool/universe/n/ncurses'
+          DIR='/tmp/android11-ncurses5'
+          mkdir -p "$DIR" /tmp/rbe-test
+          cd "$DIR"
+
+          curl -fLSs --retry 4 --retry-delay 2 \
+            "$BASE/libtinfo5_${VERSION}_amd64.deb" \
+            -o "libtinfo5_${VERSION}_amd64.deb"
+          curl -fLSs --retry 4 --retry-delay 2 \
+            "$BASE/libncurses5_${VERSION}_amd64.deb" \
+            -o "libncurses5_${VERSION}_amd64.deb"
+
+          # Published SHA-256 checksums from packages.ubuntu.com/jammy.
+          cat > SHA256SUMS <<EOF
+          4df4288404108f1a156d014e8764a064e977e34e6d44931ab60451694c03c90d  libtinfo5_${VERSION}_amd64.deb
+          58da01991712c6856af0658dc5e9cb533c1a6854ab950055ade185e35bc9c276  libncurses5_${VERSION}_amd64.deb
+          EOF
+          sha256sum -c SHA256SUMS | tee /tmp/rbe-test/legacy-ncurses-checksums.log
+
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            "./libtinfo5_${VERSION}_amd64.deb" \
+            "./libncurses5_${VERSION}_amd64.deb"
+          sudo ldconfig
+
+          echo '=== INSTALLED LEGACY LIBRARIES ==='
+          ldconfig -p | grep -E 'lib(ncurses|tinfo)\.so\.5' \
+            | tee /tmp/rbe-test/legacy-ncurses-installed.log
+
       - name: Validate BuildBuddy secret
         shell: bash
         run: |
@@ -340,6 +378,31 @@ jobs:
           sample post-deep-storage-profile
 
           echo '=== DEEP STORAGE BASELINE COMPLETE ==='
+
+      # Fail early if Android 11's bundled RenderScript compiler cannot start.
+      - name: Preflight RenderScript Clang shared libraries
+        working-directory: /home/runner/work/los
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rbe-test
+          CLANG='prebuilts/clang/host/linux-x86/clang-3289846/bin/clang.real'
+          LOG='/tmp/rbe-test/renderscript-clang-ldd.log'
+          test -x "$CLANG" || {
+            echo "::error::RenderScript compiler not found: $CLANG"
+            exit 1
+          }
+
+          echo '=== RENDERSCRIPT CLANG DYNAMIC LIBRARIES ==='
+          ldd "$CLANG" 2>&1 | tee "$LOG"
+          if grep -Eq 'not found|not a dynamic executable' "$LOG"; then
+            echo '::error::RenderScript Clang has an unresolved runtime dependency.'
+            exit 1
+          fi
+          echo '=== RENDERSCRIPT CLANG EXECUTION ==='
+          timeout 30 "$CLANG" --version 2>&1 \
+            | tee /tmp/rbe-test/renderscript-clang-version.log
+          echo 'RenderScript Clang preflight passed.'
 
       - name: Verify star2lte product registration
         working-directory: /home/runner/work/los
