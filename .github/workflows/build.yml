@@ -1,7 +1,24 @@
-name: LineageOS 18.1 - star2lte Full ROM Trial (BuildBuddy RBE)
+name: LineageOS 18.1 - star2lte RBE / Storage Compression Experiments
 
 on:
   workflow_dispatch:
+    inputs:
+      run_mode:
+        description: "Run benchmark first or build the complete ROM"
+        type: choice
+        required: true
+        default: benchmark
+        options:
+          - benchmark
+          - full_rom
+      out_storage:
+        description: "Full ROM only: optional experimental Btrfs ZSTD out/"
+        type: choice
+        required: true
+        default: plain
+        options:
+          - plain
+          - btrfs_zstd
 
 permissions:
   contents: read
@@ -17,6 +34,8 @@ jobs:
 
     env:
       BUILDBUDDY_API_KEY: "${{ secrets.BUILDBUDDY_API_KEY }}"
+      RUN_MODE: "${{ inputs.run_mode }}"
+      OUT_STORAGE: "${{ inputs.out_storage }}"
 
       # Android / Soong RBE
       USE_RBE: "1"
@@ -40,14 +59,14 @@ jobs:
       RBE_reproxy_wait_seconds: "30"
       RBE_v: "2"
 
-      # Conservative 2-job build parallelism on GitHub hosted runner.
-      # Keep memory-intensive actions serial to reduce local memory pressure.
+      # Proven faster in full-ROM trial; high-memory local jobs remain serialized.
       NINJA_REMOTE_NUM_JOBS: "16"
       NINJA_HIGHMEM_NUM_JOBS: "1"
 
       # GiB of available disk space (statvfs/df -B1, not rounded df -h).
-      DISK_WARN_GIB: "25"
-      DISK_STOP_GIB: "15"
+      # Warning at 15 GiB; experimental hard stop at 7 GiB (higher risk).
+      DISK_WARN_GIB: "15"
+      DISK_STOP_GIB: "7"
       # Stop the long build early enough to upload logs and a successful ROM.
       # Whole-job limit on GitHub-hosted runners: 360 minutes.
       FULL_ROM_SOFT_DEADLINE_MINUTES: "320"
@@ -126,6 +145,7 @@ jobs:
             rsync \
             schedtool \
             squashfs-tools \
+            btrfs-progs \
             xsltproc \
             zip \
             zlib1g-dev \
@@ -475,6 +495,39 @@ jobs:
       # Reclient 0.25 (2021) predates the Remote Execution API fix for
       # working-directory-relative output paths (SDK fix Nov 2021).
       # Pin a coherent prebuilt release rather than mixing rewrapper/reproxy.
+      # Full-ROM experimental option: create a sparse Btrfs loop image.
+      # This DOES NOT add physical storage; the outer ext4/root df remains
+      # the authoritative disk safety metric. No source/prebuilts changes.
+      - name: Prepare optional Btrfs ZSTD output filesystem
+        if: ${{ inputs.run_mode == 'full_rom' && inputs.out_storage == 'btrfs_zstd' }}
+        working-directory: /home/runner/work/los
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rbe-test
+          OUT="$PWD/out"
+          BACKING=/tmp/lineage-out-btrfs.img
+          mkdir -p "$OUT"
+          if mountpoint -q "$OUT" || [ -n "$(ls -A "$OUT")" ]; then
+            echo '::error::Refusing to hide an existing or nonempty out/ directory.'
+            exit 1
+          fi
+          # Sparse logical size 100 GiB, NOT 100 GiB of newly allocated disk.
+          # Never use fallocate here: it would consume the runner disk.
+          truncate -s 100G "$BACKING"
+          sudo mkfs.btrfs -f -m single -d single "$BACKING" \
+            > /tmp/rbe-test/out-btrfs-setup.log 2>&1
+          sudo mount -t btrfs -o loop,compress=zstd:1,noatime "$BACKING" "$OUT"
+          sudo chown "$(id -u):$(id -g)" "$OUT"
+          test "$(stat -f -c %T "$OUT")" = btrfs
+          {
+            echo 'Btrfs compression enabled on out/ (experimental)'
+            echo "backing=$BACKING"
+            echo "mount=$OUT"
+            df -hT / "$OUT"
+            mount | grep -F "$OUT" || true
+          } | tee /tmp/rbe-test/out-btrfs-setup-summary.log
+
       - name: Install compatible reclient 0.57.0 (pinned AOSP)
         working-directory: /home/runner/work/los
         timeout-minutes: 20
@@ -833,8 +886,141 @@ jobs:
           test -x "$RBE_DIR/rewrapper"
           test -x "$RBE_DIR/reproxy"
 
+          # Isolated storage benchmarks: real .o sample, independent Btrfs
+          # mount and a read-only SquashFS image. No changes to real out/.
+          if [ "$RUN_MODE" = benchmark ]; then
+            echo '=== BENCHMARK MODE: BUILD libbase SAMPLE ==='
+            m -j2 libbase 2>&1 | tee /tmp/rbe-test/benchmark-libbase.log
+            BENCH=/tmp/los18-storage-benchmark
+            REPORT=/tmp/rbe-test/storage-benchmark-report.txt
+            mkdir -p "$BENCH/objects" "$BENCH/objcopy" "$BENCH/btrfs-mount" "$BENCH/squashfs-mount"
+            benchmark_cleanup() {
+              if mountpoint -q "$BENCH/btrfs-mount"; then
+                sudo umount "$BENCH/btrfs-mount" || true
+              fi
+              if mountpoint -q "$BENCH/squashfs-mount"; then
+                sudo umount "$BENCH/squashfs-mount" || true
+              fi
+              rm -rf "$BENCH" || true
+            }
+            trap benchmark_cleanup EXIT
+            {
+              echo 'LineageOS 18.1 storage benchmarks (diagnostic only)'
+              echo "RUN_MODE=$RUN_MODE"
+              echo '=== BASELINE DISK ==='
+              df -hT / "$PWD/out"
+              echo '=== RUNNER FOOTPRINT (no deletion) ==='
+              sudo du -xhd1 /usr/local /opt /var 2>/dev/null | sort -h | tail -n 35 || true
+            } > "$REPORT" 2>&1
+            # Collect at most 128 reasonably sized real compiler objects,
+            # with a 256 MiB aggregate cap. Never mutate the original files.
+            find out/soong/.intermediates -type f -name '*.o' -size +64k \
+              -printf '%s\t%p\n' 2>/dev/null | sort -rn \
+              > "$BENCH/object-candidates.tsv" || true
+            COUNT=0
+            SAMPLE_BYTES=0
+            while IFS=$'\t' read -r bytes file; do
+              [ -f "$file" ] || continue
+              if (( COUNT >= 128 || SAMPLE_BYTES + bytes > 268435456 )); then
+                continue
+              fi
+              COUNT=$((COUNT + 1))
+              SAMPLE_BYTES=$((SAMPLE_BYTES + bytes))
+              cp -- "$file" "$BENCH/objects/$(printf '%04d' "$COUNT").o"
+            done < "$BENCH/object-candidates.tsv"
+            echo "sample_count=$COUNT apparent_bytes=$SAMPLE_BYTES" >> "$REPORT"
+            OBJCOPY='prebuilts/clang/host/linux-x86/clang-r383902b1/bin/llvm-objcopy'
+            if [ ! -x "$OBJCOPY" ]; then
+              OBJCOPY="$(command -v llvm-objcopy || true)"
+            fi
+            if [ "$COUNT" -gt 0 ] && [ -n "$OBJCOPY" ] && [ -x "$OBJCOPY" ]; then
+              echo '=== DWARF zlib compression of sampled ELF objects ===' >> "$REPORT"
+              OLD=0
+              NEW=0
+              OK=0
+              for f in "$BENCH"/objects/*.o; do
+                original="$(stat -c %s "$f")"
+                dest="$BENCH/objcopy/$(basename "$f")"
+                if "$OBJCOPY" --compress-debug-sections=zlib "$f" "$dest" \
+                    >> /tmp/rbe-test/dwarf-objcopy.log 2>&1; then
+                  OLD=$((OLD + original))
+                  NEW=$((NEW + $(stat -c %s "$dest")))
+                  OK=$((OK + 1))
+                fi
+              done
+              echo "dwarf_compressed_objects=$OK original_bytes=$OLD compressed_bytes=$NEW" >> "$REPORT"
+              if (( OLD > 0 )); then
+                awk -v a="$OLD" -v b="$NEW" 'BEGIN {printf "DWARF objcopy size reduction = %.1f%%\n", 100*(a-b)/a}' >> "$REPORT"
+              fi
+            else
+              echo 'DWARF comparison skipped: objects or llvm-objcopy missing' >> "$REPORT"
+            fi
+            # Compare the exact same input sample on regular ext4 and a
+            # separate compression-enabled Btrfs mount, not production out/.
+            if [ "$COUNT" -gt 0 ]; then
+              echo '=== Btrfs ZSTD:1 sample ===' >> "$REPORT"
+              BTRFS_IMG="$BENCH/btrfs-test.img"
+              truncate -s 2G "$BTRFS_IMG"
+              if sudo mkfs.btrfs -f -m single -d single "$BTRFS_IMG" \
+                   > /tmp/rbe-test/btrfs-benchmark-setup.log 2>&1 \
+                 && sudo mount -t btrfs -o loop,compress=zstd:1,noatime \
+                   "$BTRFS_IMG" "$BENCH/btrfs-mount" \
+                   >> /tmp/rbe-test/btrfs-benchmark-setup.log 2>&1; then
+                sudo chown "$(id -u):$(id -g)" "$BENCH/btrfs-mount"
+                cp -a "$BENCH/objects/." "$BENCH/btrfs-mount/"
+                sync
+                echo "ext4_sample_physical_bytes=$(du -sB1 "$BENCH/objects" | cut -f1)" >> "$REPORT"
+                echo "btrfs_contents_physical_bytes=$(du -sB1 "$BENCH/btrfs-mount" | cut -f1)" >> "$REPORT"
+                echo "btrfs_image_allocated_bytes=$(du -sB1 "$BTRFS_IMG" | cut -f1)" >> "$REPORT"
+                echo "btrfs_sample_identical=$(diff -qr "$BENCH/objects" "$BENCH/btrfs-mount" >/dev/null && echo yes || echo no)" >> "$REPORT"
+                sudo umount "$BENCH/btrfs-mount"
+              else
+                echo 'Btrfs loop mount unavailable on this runner; skipped.' >> "$REPORT"
+              fi
+            fi
+            # SquashFS compresses a REAL compiler tree and verifies the
+            # mounted compiler executes. Read-only; source checkout unchanged.
+            TOOLCHAIN='prebuilts/clang/host/linux-x86/clang-r383902b1'
+            if [ -d "$TOOLCHAIN" ]; then
+              echo '=== SquashFS ZSTD Clang toolchain ===' >> "$REPORT"
+              echo "toolchain_apparent_bytes=$(du -sb "$TOOLCHAIN" | cut -f1)" >> "$REPORT"
+              SQUASH="$BENCH/clang-toolchain.sqfs"
+              if mksquashfs "$TOOLCHAIN" "$SQUASH" \
+                   -comp zstd -processors 2 -mem 512M -noappend \
+                   > /tmp/rbe-test/squashfs-benchmark-build.log 2>&1; then
+                echo "squashfs_image_bytes=$(stat -c %s "$SQUASH")" >> "$REPORT"
+                if sudo mount -t squashfs -o loop,ro "$SQUASH" "$BENCH/squashfs-mount" \
+                     >> /tmp/rbe-test/squashfs-benchmark-build.log 2>&1; then
+                  if "$BENCH/squashfs-mount/bin/clang" --version \
+                       > /tmp/rbe-test/squashfs-clang-version.log 2>&1; then
+                    echo 'squashfs_clang_exec=PASS' >> "$REPORT"
+                  else
+                    echo 'squashfs_clang_exec=FAIL (inspect log)' >> "$REPORT"
+                  fi
+                  sudo umount "$BENCH/squashfs-mount"
+                else
+                  echo 'squashfs_mount=unavailable' >> "$REPORT"
+                fi
+              else
+                echo 'SquashFS benchmark unsupported/failed; see log.' >> "$REPORT"
+              fi
+            fi
+            echo '=== BENCHMARK END DISK ===' >> "$REPORT"
+            df -hT / >> "$REPORT"
+            cat "$REPORT"
+            {
+              echo '## Compression benchmark (no production changes)'
+              echo '```text'
+              tail -n 60 "$REPORT"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            disk_sample post-storage-benchmark >/dev/null
+            echo '=== BENCHMARK COMPLETE: no full ROM build requested ==='
+            exit 0
+          fi
+
           echo "=== FULL ROM BUILD: star2lte / bacon ==="
-          echo "RBE remote-only enabled; jobs=2, highmem=1, no local ccache."
+          echo "RBE remote-only enabled; remote=16, local=3, highmem=1, no local ccache."
           echo "The previous libbase test passed; this run compiles and packages the full ROM."
           enforce_initial_disk_guard pre-build
 
@@ -884,7 +1070,7 @@ jobs:
           }
           trap cleanup_build_supervisor EXIT
 
-          echo '=== FULL ROM STORAGE / MEMORY / TIME MONITOR (30s) ==='
+          echo '=== FULL ROM STORAGE / MEMORY / TIME MONITOR (30s; 5s under 15 GiB) ==='
           : > /tmp/rbe-test/resource-monitor.log
           WARNED=0
           while kill -0 "$BUILD_PID" 2>/dev/null; do
@@ -912,8 +1098,11 @@ jobs:
               echo "::warning::Less than ${DISK_WARN_GIB} GiB remains; full ROM build may be stopped."
               WARNED=1
             fi
-            # Wait up to 30 seconds without delaying a completed build.
-            for ((tick=0; tick<6; tick++)); do
+            # At low disk, sample every 5 seconds so a 7 GiB guard
+            # has less chance to be overtaken by rapidly growing output.
+            SLEEP_TICKS=6
+            if (( avail < 15 * 1073741824 )); then SLEEP_TICKS=1; fi
+            for ((tick=0; tick<SLEEP_TICKS; tick++)); do
               kill -0 "$BUILD_PID" 2>/dev/null || break
               sleep 5
             done
@@ -969,7 +1158,7 @@ jobs:
           echo 'Full bacon target completed with remote C++ compilation enabled.'
 
       - name: Upload completed LineageOS ROM
-        if: success()
+        if: ${{ success() && inputs.run_mode == 'full_rom' }}
         uses: actions/upload-artifact@v4
         with:
           name: lineage-18.1-star2lte-${{ github.run_id }}
@@ -986,7 +1175,8 @@ jobs:
           mkdir -p /tmp/rbe-test
           FILE=/tmp/rbe-test/resource-samples.tsv
           {
-            echo '## LineageOS 18.1 full ROM trial — disk and RAM'
+            echo '## LineageOS 18.1 RBE / storage experimental trial — disk and RAM'
+            echo "Mode: ${RUN_MODE}, output storage: ${OUT_STORAGE}"
             echo ''
             echo '| Stage (UTC) | Free GiB | Used GiB | RAM available GiB |'
             echo '|---|---:|---:|---:|'
@@ -1205,3 +1395,20 @@ jobs:
             /home/runner/work/los/.repo/repo.log
           if-no-files-found: warn
           retention-days: 7
+
+      - name: Cleanup experimental Btrfs output mount
+        if: ${{ always() && inputs.run_mode == 'full_rom' && inputs.out_storage == 'btrfs_zstd' }}
+        working-directory: /home/runner/work/los
+        shell: bash
+        run: |
+          set +e
+          OUT="$PWD/out"
+          IMG=/tmp/lineage-out-btrfs.img
+          echo '=== OUT BTRFS FINAL STATUS ==='
+          df -hT / "$OUT" || true
+          if mountpoint -q "$OUT"; then
+            sudo umount "$OUT" || echo '::warning::Failed to unmount experimental out Btrfs filesystem'
+          fi
+          if ! mountpoint -q "$OUT"; then
+            rm -f "$IMG"
+          fi
