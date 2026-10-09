@@ -42,7 +42,7 @@ jobs:
 
       # Conservative 2-job build parallelism on GitHub hosted runner.
       # Keep memory-intensive actions serial to reduce local memory pressure.
-      NINJA_REMOTE_NUM_JOBS: "2"
+      NINJA_REMOTE_NUM_JOBS: "16"
       NINJA_HIGHMEM_NUM_JOBS: "1"
 
       # GiB of available disk space (statvfs/df -B1, not rounded df -h).
@@ -862,7 +862,7 @@ jobs:
           (
             set +e
             set -o pipefail
-            m -j2 bacon 2>&1 | tee "$BUILD_LOG"
+            m -j3 bacon 2>&1 | tee "$BUILD_LOG"
             rc=${PIPESTATUS[0]}
             printf '%s\n' "$rc" > "$BUILD_STATUS_FILE"
             exit "$rc"
